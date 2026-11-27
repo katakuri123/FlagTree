@@ -4,6 +4,10 @@ if(FLAGTREE_TLE)
         TleToLLVM
         TritonTLETransforms
     )
+    if(FLAGCX_ENABLED)
+        # FlagCX rank/signal/barrier lowering shared with the other backends.
+        list(APPEND _TLE_LIBS FlagCxToLLVM)
+    endif()
 else()
     set(_TLE_LIBS "")
 endif()

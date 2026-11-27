@@ -4,10 +4,13 @@ TLE_SUPPORTED_PRIMITIVES = [
     "raw.call_smem",
 
     ## TLE-Lite
+    "shard_id",
+    "remote",
+    "signal",
+    "signal_wait",
     "load",
     "extract_tile",
     "insert_tile",
-    "distributed_barrier",
     "cumsum",
 
     ## TLE-Struct GPU

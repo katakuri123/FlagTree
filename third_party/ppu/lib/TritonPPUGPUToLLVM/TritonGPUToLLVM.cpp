@@ -51,6 +51,11 @@
 #include "tle/dialect/include/Conversion/TleToLLVM/PackOpToLLVM.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/PatternTleToLLVM.h"
+#ifdef FLAGCX_ENABLED
+#include "tle/dialect/include/Conversion/TleToLLVM/FlagCxOpToLLVM/FlagCxOpToLLVM.h"
+#include "tle/dialect/include/Conversion/TleToLLVM/NodeTransferOpToLLVM.h"
+#include "tle/dialect/include/Conversion/TleToLLVM/SignalOpToLLVM.h"
+#endif
 #endif
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -107,12 +112,12 @@ public:
 
 #ifdef __TLE__
 // Partial conversion target for the TLE lowering pre-pass on PPU.
-// PPU only ships a subset of TLE: local_pointers, extract*, pack, extract_tile,
-// insert_tile, dsl_region, memdesc_alias. WGMMA/TMA/distributed_barrier/
-// exclusive_cumsum/remote_pointers are NVIDIA-only at this stage — they are
-// left out of the pattern set and will produce a legalization failure if a
-// kernel emits them, which is the intended behavior until those features are
-// ported.
+// PPU ships local_pointers, extract*, pack, extract_tile, insert_tile,
+// dsl_region and memdesc_alias. FlagCX rank/signal lowering and the
+// remote/node pointer patterns are registered when FLAGCX_ENABLED; WGMMA, TMA
+// and distributed_barrier remain NVIDIA-only until their PPU lowering exists.
+// RemotePointers/NodePut/NodeGet are kept legal here so the main conversion
+// can lower them together with their pointer producers.
 class TleLLVMConversionTarget : public ConversionTarget {
 public:
   explicit TleLLVMConversionTarget(MLIRContext &ctx,
@@ -122,6 +127,9 @@ public:
                     NVVM::NVVMDialect, mlir::gpu::GPUDialect>();
     addIllegalDialect<tle::TleDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+#ifdef FLAGCX_ENABLED
+    addLegalOp<tle::RemotePointersOp, tle::NodePutOp, tle::NodeGetOp>();
+#endif
     addDynamicallyLegalOp<tle::DSLRegionOp, tle::YieldOp>(
         [&](Operation *op) -> bool {
           bool hasLegalRegions = true;
@@ -288,10 +296,9 @@ struct ConvertTritonGPUToLLVMPPU
       TleLLVMConversionTarget tleTarget(*context, typeConverter);
       RewritePatternSet tlePatterns(context);
       // local_pointers + Extract*/Pack/DSL-region/extract_tile/insert_tile
-      // + memdesc_alias — the subset of TLE ops PPU supports today. Patterns
-      // for distributed barriers, exclusive cumsum, WGMMA descriptor views,
-      // WGMMA fences and TMA store commit groups are intentionally not
-      // registered: those ops never appear on PPU and a legalization failure
+      // + memdesc_alias. FlagCX rank/signal/barrier patterns are added when
+      // the build enables FlagCX. distributed_barrier and WGMMA/TMA remain
+      // unregistered: those ops never appear on PPU and a legalization failure
       // is the right signal if a kernel does emit them.
       mlir::triton::tle::populateDSLRegionOpToLLVMPatterns(
           typeConverter, tlePatterns, benefit);
@@ -309,6 +316,14 @@ struct ConvertTritonGPUToLLVMPPU
           typeConverter, tlePatterns, benefit);
       mlir::triton::tle::populateExclusiveCumsumOpToLLVMPatterns(
           typeConverter, targetInfo, tlePatterns, benefit);
+#ifdef FLAGCX_ENABLED
+      mlir::triton::tle::populateSignalOpToLLVMPatterns(typeConverter,
+                                                        tlePatterns, benefit);
+      // PPU's FlagCX Device IR exports generic (AS0) pointers; the shared
+      // lowering defaults to NVIDIA's AS1.
+      mlir::triton::tle::populateFlagCxOpToLLVMPatterns(
+          typeConverter, tlePatterns, benefit, /*ptrAddressSpace=*/0);
+#endif
       if (failed(
               applyPartialConversion(mod, tleTarget, std::move(tlePatterns)))) {
         return signalPassFailure();
@@ -367,6 +382,14 @@ struct ConvertTritonGPUToLLVMPPU
         typeConverter, patterns, computeCapability, benefit);
     mlir::triton::populateInstrumentationToLLVMPatterns(
         typeConverter, targetInfo, patterns, benefit);
+#ifdef FLAGCX_ENABLED
+    // Remote/node pointers are lowered with the main pointer conversion so
+    // they see the converted tt.ptr/tt.load/tt.store operand types.
+    mlir::triton::tle::populateRemotePointersOpToLLVMPatterns(
+        typeConverter, targetInfo, patterns, benefit);
+    mlir::triton::tle::populateNodeTransferOpToLLVMPatterns(
+        typeConverter, patterns, benefit);
+#endif
 
     TritonLLVMConversionTarget convTarget(*context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))

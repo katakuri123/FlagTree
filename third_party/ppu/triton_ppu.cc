@@ -304,4 +304,17 @@ void init_triton_ppu(py::module &&m) {
     }
     return false;
   });
+
+  // Whether a specific external library must be linked. PPU uses this to keep
+  // the large FlagCX Device IR bitcode out of kernels that never call it.
+  m.def("need_extern_lib", [](llvm::Module *module,
+                               const std::string &lib) -> bool {
+    for (const auto &f : *module) {
+      if (f.hasExternalLinkage() && f.hasName() && !f.hasExactDefinition() &&
+          !f.isIntrinsic() && f.getName().contains(lib)) {
+        return true;
+      }
+    }
+    return false;
+  });
 }

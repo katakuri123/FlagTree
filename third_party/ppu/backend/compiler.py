@@ -26,6 +26,8 @@ try:
 except ImportError:
     tle = None
 from triton import knobs
+from triton.runtime._distributed import DistributedRtContext
+from .distributed import Distributed
 
 from dataclasses import dataclass
 import functools
@@ -48,8 +50,12 @@ PPU_UNSUPPORTED_TLE_OPS = {
     "ttg.warp_specialize": "tle.warp_specialize",
     "ttg.tma_copy": "tle.gpu.copy.tensor_descriptor",
     "tle.distributed_barrier": "tle.distributed_barrier",
-    "tle.remote_pointers": "tle.remote",
 }
+
+# Remote pointers are lowered for intra-node device space in Phase 3.  Node
+# space stays gated until the inter-node transfer path is validated; cluster
+# and chiplet spaces have no PPU semantics.
+PPU_SUPPORTED_REMOTE_SPACES = {"device"}
 
 
 def reject_unsupported_tle(mod):
@@ -58,7 +64,13 @@ def reject_unsupported_tle(mod):
     # mod.walk takes a void callback and cannot be interrupted from Python, so
     # collect during the walk and report every unsupported feature at once.
     def visit(op):
-        feature = PPU_UNSUPPORTED_TLE_OPS.get(op.get_name())
+        name = op.get_name()
+        if name == "tle.remote_pointers":
+            space = op.get_str_attr("space")
+            if space not in PPU_SUPPORTED_REMOTE_SPACES:
+                features.add(f"tle.remote(space={space!r})")
+            return
+        feature = PPU_UNSUPPORTED_TLE_OPS.get(name)
         if feature is not None:
             features.add(feature)
 
@@ -235,6 +247,10 @@ class HGGCOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get('libdevice', None):
             extern_libs['libdevice'] = knobs.ppu.libdevice_path or str(default_libdir / 'libdevice.ppu.bc')
+        # FlagCX Device IR bitcode, discovered from the PPU backend-local
+        # checkout.  Distributed() returns {} when the dependency is disabled
+        # or not installed, keeping ordinary kernels free of this library.
+        extern_libs.update(Distributed().get_extern_libs())
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
@@ -376,6 +392,12 @@ class PPUBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
+        if tle is not None:
+            # Fuse node-space copies before conversion so pointer provenance
+            # still refers to the original function argument ordinals.
+            tle.passes.add_fuse_node_remote_transfers(pm)
+            if DistributedRtContext().is_lite_mode:
+                tle.passes.add_params_for_distribution(pm)
         passes.ttir.add_convert_to_ttgpuir(pm, f"ppu:{capability}", opt.num_warps, 32, opt.num_ctas)
         if tle is not None:
             tle.raw_passes.add_tle_convert_arg_to_memdesc(pm)
@@ -431,6 +453,7 @@ class PPUBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
+        metadata["tle_node_buffer_bindings"] = mod.get_operation().get_str_attr("tle.node_buffer_bindings") or ""
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -530,8 +553,16 @@ class PPUBackend(BaseBackend):
                 ppu.set_smemsize(k, shared_size)
 
         if options.extern_libs and ppu.has_extern_deps(llvm_mod):
-            paths = [path for (name, path) in options.extern_libs]
-            llvm.link_extern_libs(llvm_mod, paths)
+            paths = []
+            for name, path in options.extern_libs:
+                # The FlagCX bitcode is large; only link it when the kernel
+                # actually references a flagcx symbol.  libdevice and any
+                # other extern libraries keep their existing behavior.
+                if name == "libflagcx" and not ppu.need_extern_lib(llvm_mod, "flagcx"):
+                    continue
+                paths.append(path)
+            if paths:
+                llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
 

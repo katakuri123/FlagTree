@@ -37,6 +37,10 @@ if enabled:
         flagcxUniqueId,  # noqa: F401
         FLAGCX_WIN_COLL_SYMMETRIC,
     )
+
+    # Backends may need a different window mode (PPU uses the asymmetric IPC
+    # window because its symmetric/VMM path cannot export signal buffers).
+    FLAGCX_WINDOW_FLAGS = getattr(flagcx_rt_conf, "window_flags", FLAGCX_WIN_COLL_SYMMETRIC)
     import os
     import tempfile
     import torch
@@ -112,7 +116,10 @@ def compile_flagcx_allocator():
             load_inline(
                 name=lib_name,
                 cpp_sources=flagcx_allocator_source,
-                with_cuda=True,
+                # Backends that can build the host-only shim without a CUDA
+                # toolchain set allocator_with_cuda=False (PPU does); the
+                # default preserves the previous behavior elsewhere.
+                with_cuda=getattr(flagcx_rt_conf, "allocator_with_cuda", True),
                 extra_ldflags=[
                     f"-L{FLAGCX_LIB_PATH}",
                     "-lflagcx",
@@ -225,9 +232,10 @@ def create_dist_tensor(buf_tensor):
     buf_ptr = buf_tensor.data_ptr()
     buf_size = buf_tensor.numel() * buf_tensor.element_size()
 
-    # Register buffer with symmetric window for LSA
-    win = flagcx.flagcxCommWindowRegister(comm, buf_ptr, buf_size, flags=FLAGCX_WIN_COLL_SYMMETRIC)
-    print(f"[Rank {rank}] Window registered (symmetric)")
+    # Register buffer with the backend-selected window mode (symmetric by
+    # default; PPU uses the asymmetric IPC window).
+    win = flagcx.flagcxCommWindowRegister(comm, buf_ptr, buf_size, flags=FLAGCX_WINDOW_FLAGS)
+    print(f"[Rank {rank}] Window registered (flags={FLAGCX_WINDOW_FLAGS})")
 
     # Create DevComm with 1 intra barrier
     reqs = flagcxDevCommRequirements()
