@@ -582,3 +582,151 @@ tle.signal_wait(ctx, slot, wait_kind, target, group_kind, context_id, order)
 - 死锁检测由 `test_tle_signal_wait.sh` 的 `RUN_TIMEOUT`（默认 600s）提供；未执行“故意不发送信号”的负向挂起测试，避免影响共享设备。
 - 双卡/多卡仍依赖 `FLAGCX_P2P_BUFFER_SIZE=1048576` / `FLAGCX_P2P_CHUNK_SIZE=1048576`。
 - 下一阶段：Phase 5 `tle.distributed_barrier`，等待确认。
+
+## 12. Phase 4.5：通信语义收敛与工程加固
+
+### 12.1 审查发现核实结果
+
+| # | 审查发现 | 核实结果 | 状态 |
+|---|---|---|---|
+| 1 | block/warp 组 signal 的数据可见性未覆盖 | **确认**：per-element ping-pong 在 block/warp 组失败，thread 组通过；根因是 FlagCX collective signal 只由 leader thread/lane 发 release atomic，其他线程的 payload store 未被 system fence 覆盖；consumer 侧普通 `tl.load` 也会命中旧缓存 | **已修复/已补测** |
+| 2 | stress 测试不是真正的每轮发布/消费 | **确认**：原 `_produce_stress` 只写一次数据再连续 signal；新增设备侧 ping-pong，每轮独立 payload + ACK + 校验 | **已修复/已补测** |
+| 3 | Runtime 环境配置在模块导入时生效 | **确认**：`FlagcxRuntimeConfig.__init__` 曾 `setdefault(FLAGCX_VMM_ENABLE)`，compile-only 导入有副作用 | **已修复** |
+| 4 | Bundle 版本/ABI 一致性不足 | **确认**：metadata 缺 hashes/triple/SDK；`file_hash` 被 `lru_cache(path)` 缓存，文件原地替换后 compile cache 不失效 | **已修复** |
+| 5 | 64MB P2P buffer 是否硬限制 | **不成立为固定限制**：空闲设备上默认 64MB/16MB 在 2/4/8 卡均稳定通过；设备 0/2 被外部负载占用时失败；chunk=1MB+buffer=64MB 可复现分配失败 | **已定位为环境/配置相关** |
+| 6 | Lite-mode 是否可用 | PPU driver 缺隐式参数插入且 `PyArg` format 在建签名前生成；共享 JIT launch 使用新建空 `DistributedRtContext`（指针为 None） | **PPU plumbing 已修复；共享 JIT 空指针为遗留** |
+| 7 | Grid barrier 的 scratch/PTX 依赖 | 共享 grid lowering 使用 `NVVM` IDs、inline PTX `atom.add.release.gpu`/`ld.acquire.gpu`，并依赖 `ttg.global_scratch_memory_offset`；TLE 管线当前无 pass 设置该 attr | **Phase 5 重点** |
+| 8 | BAREX 远端 signal atomic 缺口 | `barex_adaptor.cc` 明确 `iputSignal = NULL`（BAREX 无 remote atomic primitive）；one-sided put/get 存在 | **Phase 6 阻塞项（源码确认）** |
+
+### 12.2 已修复问题
+
+1. **Collective signal/wait 的系统可见性**
+   - `FlagcxUtils.cpp` 新增 `emitPpuSystemFence`：PPU 对 block/warp 组的 `flagcxDevSignal*` 前、`flagcxDevWait*` 后，为每个线程插入 `ppu.fence.sc.sys`。
+   - `FlagCxSignalOpToLLVM.cpp` 将 `collectiveFence` 传入 signal/wait lowering；PPU 注册时传 `true`，NVIDIA/HCU 默认 `false`，不改变其行为。
+   - thread 组不插入额外 fence（每线程自身 release/acquire 已覆盖）。
+   - 验证：同一 kernel 内 store→signal、wait→remote load，block/warp/thread 均通过。
+
+2. **Peer 轮询读取必须使用 volatile load**
+   - 远端内存被对端在 kernel 运行期间更新时，普通 `tl.load` 会命中本地缓存；测试中的 remote load 全部改为 `volatile=True`。
+   - 这是 TLE peer-polling 的使用约束，需在公共文档/后续原语中明确；Phase 5 的 barrier 后数据读取同样需要。
+
+3. **真正的设备侧 Ping-Pong**
+   - 新增 `test_tle_signal_pingpong.py/.sh`：ring 内每轮写不同 payload、signal、wait、校验、ACK、等 ACK；Host 只在配置之间同步。
+   - 覆盖 block/warp/thread、1M payload、4096 轮、多生产者 star。
+
+4. **Runtime 配置延迟与 VMM/Window**
+   - `FlagcxRuntimeConfig.__init__` 不再修改环境；新增 `apply_runtime_env()`，由 `communication.py::init_communicator()` 在 `flagcxCommInitRank` 前调用。
+   - 用户显式 `FLAGCX_VMM_ENABLE` 优先；显式 `=1` 给出警告；`FLAGCX_PPU_WINDOW_FLAGS=1`（symmetric）明确报错。
+   - compile-only 导入不再有环境副作用；单进程重复初始化仍受共享 `_init_communicator_` latch 限制（见 12.5）。
+
+5. **Bundle ABI 一致性**
+   - Registrar metadata 增加 `metadata_version`、`target_triple`、`target_datalayout`、`sdk_version`、`build_flags`、host/bitcode/headers/wrapper SHA-256。
+   - Runtime `validate_bundle()` 在通信初始化前校验 hashes、triple、arch；多 metadata 文件 commit/hash 不一致时报错；缺失 metadata 警告。
+   - `file_hash` 改为按 `(realpath, mtime_ns, size, inode)` 缓存，原地重建 bitcode 会使 `HGGCOptions.hash()` 变化并失效 compile cache。
+   - 测试覆盖 hash mismatch、triple 错误、缺失 metadata、混合 bundle root、extern lib 内容替换。
+
+6. **Lite-mode PPU plumbing**
+   - `third_party/ppu/backend/driver.py` 在 lite 模式插入两个 `*i64` 隐式参数，并在插入之后生成 `PyArg_ParseTuple` format（修复 20 vs 18 参数错误）。
+   - `HGGCOptions.lite_dist` 参与 compile cache key；`make_ttgir` 使用该字段。
+   - `lite_mode_probe.py/.sh` 验证 plain kernel 的隐式参数 ABI/launch 链路（2 卡）。
+
+### 12.3 新增及修改的测试
+
+| 文件 | 内容 |
+|---|---|
+| `third_party/ppu/python/test/unit/tle/test_tle_signal_pingpong.py/.sh` | 设备侧 ring/star ping-pong；block/warp/thread、1M payload、4096 轮、多生产者、timeout |
+| `third_party/ppu/python/test/unit/tle/test_tle_signal_wait.py` | 增加 block nw1/nw2、warp nw4、thread nw1；remote load 改 volatile；单节点 guard |
+| `third_party/ppu/python/test/unit/tle/test_tle_signal_compile.py` | 增加 collective fence 断言（block/warp 有、thread 无） |
+| `third_party/ppu/python/test/unit/tle/test_tle_runtime_config.py` | VMM 默认/显式/非法组合、bundle hash/triple/缺失/混合 root、extern lib cache key |
+| `third_party/ppu/python/test/unit/tle/test_tle_remote_compile.py` / `test_tle_remote_intra_node.py` | remote load 改 volatile |
+| `third_party/ppu/python/test/unit/tle/lite_mode_probe.py/.sh` | Lite-mode 最小 launch 验证（非 pytest 收集） |
+| `third_party/ppu/backend/compiler.py`、`driver.py`、`distributed.py` | 上述修复 |
+
+### 12.4 实际测试结果
+
+| 测试项 | 命令 | 结果 |
+|---|---|---|
+| Clean build | `rm -rf build && pip install -e . --no-build-isolation`（`FLAGTREE_BACKEND=ppu`） | **PASS**：退出 0，`flagtree-0.7.0+ppu.gita09986a8` |
+| FlagCX pin 一致性 | 全局 `c93438d...`；PPU `4879b88...`；metadata 同 commit | **PASS** |
+| Signal 分组矩阵 | `NPROC_PER_NODE=2 test_tle_signal_wait.sh` | **PASS**：block nw1/nw2/nw4、warp nw4、thread nw1、add/world、多生产者、1M、stress |
+| Ping-pong 2 卡 | `NPROC_PER_NODE=2 test_tle_signal_pingpong.sh`（4096 轮 + 1M + warp/thread + star） | **PASS** |
+| Ping-pong 4 卡 | `NPROC_PER_NODE=4 PINGPONG_ROUNDS=1024 ...` | **PASS**（4/4 Rank） |
+| Ping-pong 8 卡 | `NPROC_PER_NODE=8 PINGPONG_ROUNDS=512 ...` | **PASS**（8/8 Rank） |
+| Runtime config / bundle | `pytest -q test_tle_runtime_config.py` | **9 passed** |
+| Signal compile | `pytest -q test_tle_signal_compile.py` | **4 passed** |
+| Lite-mode | `NPROC_PER_NODE=2 lite_mode_probe.sh` | **PASS**（plain kernel ABI；TLE op in lite mode 未验证） |
+| shard_id 双卡 | `NPROC_PER_NODE=2 test_tle_shard_id_distributed.sh` | **PASS**（world/device/node 校验） |
+| remote intra_node 双卡 | `NPROC_PER_NODE=2 test_tle_remote_intra_node.sh` | **PASS**（N=4096，large N=1M） |
+| P2P 默认 64MB/16MB | 2/4/8 卡，空闲设备，3 次重复 | **PASS** |
+| P2P 1MB/1MB | 2 卡，空闲设备，3 次重复 | **PASS** |
+| P2P chunk=1MB + buffer=64MB | 2 卡 | **FAIL**（后续 `flagcxMemAlloc` 8MB 失败；配置/分配器相关） |
+| 设备 0/2 高占用 | 8 卡首次尝试 | **FAIL/OOM**（外部负载占 96GB/94GB；环境问题） |
+| PPU TLE 全量回归 | `pytest -q third_party/ppu/python/test/unit/tle/`（clean build 后） | **163 passed, 4 skipped, 1 xfailed** |
+| 普通 Triton 基线 | vector add + row reduction | **PASS** |
+| Package data（静态） | `get_package_data` 5 组 glob | **PASS**（5/5 命中） |
+
+### 12.5 尚未解决问题及优先级
+
+| 优先级 | 问题 | 说明 |
+|---|---|---|
+| P0 | Grid barrier scratch 管线 | `DistributedBarrierOpToLLVM` 读取 `ttg.global_scratch_memory_offset`，但当前 TLE pipeline 无 pass 设置；PPU grid 实现需补分配/初始化 |
+| P0 | Grid barrier 的 inline PTX | 共享 lowering 使用 `atom.add.release.gpu`/`ld.acquire.gpu`；PPU 需 `ppu.atom.*.sys`/`ppu.ld.acquire.sys` |
+| P0 | 多节点 inter_node | 无第二台主机；`space="inter"`/inter-node signal/put/get 运行期未验证 |
+| P1 | 共享 Lite-mode JIT 空指针 | `DistributedRtContext()` 新实例的 `comm_ptr`/`mem_ptr` 为 None；TLE op 的 lite-mode 运行期仍不可用 |
+| P1 | counter/shadow wait | 无公共 counter 生产端；shadow 依赖内部维护，仅编译验证 |
+| P1 | 多消费者同槽位 | 一进程一设备，无法构造同槽位多消费者 |
+| P2 | chunk=1MB/buffer=64MB 分配失败 | FlagCX/PPU GDR 分配器碎片/池限制，需上游定位 |
+| P2 | wheel 端到端打包 | 仅静态验证 package_data；未构建 wheel |
+
+### 12.6 Phase 5 详细实现方案（不本阶段实现）
+
+**5.1 FlagCX 跨设备 barrier（优先）**
+- 前端：`tle.distributed_barrier(space="device"/"inter"/"world", ...)` 已映射到 `tle.distributed_barrier` 的 `space` 属性。
+- 编译器：
+  - `reject_unsupported_tle` 对 `tle.distributed_barrier` 改为 space-aware：允许 `device`/`inter`/`world`；`grid`/`grid_axis`/`submesh`/cluster 继续显式拒绝，直到各自 lowering 验证。
+  - PPU `TritonGPUToLLVM.cpp` 注册 `populateDistributedBarrierOpToLLVMPatterns`；`lowerFlagCxSpaceBarrier` 生成 `tle.flagcx barrier`，由已注册的 `populateFlagCxBarrierOpToLLVMPatterns(ptrAddressSpace=0)` 降到 `flagcxDevBarrierSync/Arrive/Wait`。
+- 验证：
+  - 编译级断言 `flagcxDevBarrierSync`/AS0/无 PTX；`space="device"` 2 卡 producer/consumer + barrier + remote read；`space="world"` 单节点；`space="inter"` 多节点 BLOCKED。
+  - 检查 barrier 的 team/参与 Rank 一致性；`barrier_count`/`context_id` 与 `create_dist_tensor` 的 `barrierCount=8` 匹配。
+
+**5.2 PPU Grid barrier（第二阶段）**
+- 复用算法：global scratch 上 sense-reversing 计数器（高 bit flip），每 CTA thread 0 到达，其他线程 CTA barrier。
+- PPU 原子/加载：用 inline asm `ppu.atom.add.release.sys.u64`、`ppu.ld.acquire.sys.b64`、`ppu.fence.sc.sys`；避免 NVIDIA PTXBuilder。
+- Scratch：
+  - 在 TLE TTGIR 阶段新增/复用 pass，为每个 grid/grid_axis barrier 分配 global scratch 并设置 `ttg.global_scratch_memory_offset`；
+  - 确认 PPU `add_allocate_global_scratch_memory`、driver `global_scratch` 参数、metadata `global_scratch_size` 一致；
+  - 确认 scratch 在 launch 前清零；若不清零，需在 kernel 首次使用前初始化或使用 generation。
+- 启动/驻留：
+  - PPU driver 已支持 `HG_LAUNCH_ATTRIBUTE_COOPERATIVE`；grid barrier 要求所有参与 CTA 并发驻留。
+  - 通过 `hggcDevAttrCooperativeLaunch` + `hggcOccupancyMaxActiveBlocksPerMultiprocessor` 校验 grid size；不满足时给出明确错误而不是死锁。
+  - `num_ctas>1`/cluster 与 grid barrier 的组合需显式拒绝或验证。
+- 测试：1/2/4 CTA、不同 num_warps、重复 barrier 代际、barrier 前后远端数据、超时检测、grid > residency 的错误路径。
+- 风险：TLE scratch 管线缺失、PPU cooperative launch 限制、grid barrier 与 cluster 混用。
+
+**5.3 Cluster/submesh**
+- 共享 lowering 使用 `NVVM::ClusterArrive/Wait` 与 submesh shared scratch；PPU cluster 语义未验证。
+- Phase 5 对 `group_kind="submesh"`/cluster-only mesh 显式拒绝，待 PPU cluster 能力确认后再开放。
+
+### 12.7 Phase 6 底层能力及阻塞条件
+
+源码证据：
+
+- `barex_adaptor.cc` 明确 `iputSignal = NULL`，注释“BAREX has no remote atomic primitive”；one-sided `iput`/`iget` 存在。
+- Device bitcode 提供 `flagcxDevNetPutS`/`GetS`/`GetFromCommS` 及 `PutS_RSigInc/RSigAdd`；TLE NodeTransfer lowering 使用无 RSig 的 `flagcxDevNetPutS/GetS`。
+- `default_comm_traits.h` 的 signal 在 direct peer 指针 + `useP2pSignals` 时走 direct atomic，否则 `enqueueFifoSignalAction`（proxy）；跨节点无 direct peer 指针，依赖 FIFO/proxy。
+- PPU 构建 `USE_ACCL_BAREX=1, USE_UCX=0`，网络适配器为 BAREX/ACCL；跨节点需要真实 BAREX 网络与 MR 注册。
+
+Phase 6 Go/No-Go 前置条件：
+
+1. 至少 2 台物理 PPU 主机，BAREX/ACCL 网络互通；可创建多节点 `torch.distributed` 与 FlagCX inter communicator。
+2. 验证 BAREX one-sided PUT/GET 与 `flagcxDevNet*` 设备端完成机制（net context、MR、fence）。
+3. 确认 inter-node signal 的 proxy/FIFO 路径可用；若依赖 `iputSignal`（BAREX 为 NULL），则 **No-Go**，需 FlagCX/BAREX 提供远端 signal 或经证实的代理实现。
+4. 验证 asymmetric window + VMM=0 在多节点注册/窗口生命周期下可用；跨节点不能假设远端指针可解引用。
+5. 明确 multi-node 环境获取时间；在此之前 Phase 6 只能做主机侧/编译侧预研，不能标记完成。
+
+### 12.8 Phase 5 Go/No-Go 结论
+
+- **5.1 FlagCX space barrier：Go**。可直接复用现有 FlagCxBarrier lowering、AS0 参数化与双卡通信上下文；风险低。
+- **5.2 PPU grid barrier：Conditional Go**。算法与 PPU 原子能力具备，但必须先补齐 TLE global scratch 分配/清零管线并验证 cooperative launch 驻留；未完成前不得开放 grid barrier。
+- **5.3 cluster/submesh：No-Go（本阶段）**。PPU cluster 语义未验证，显式拒绝。
+- **Phase 6：No-Go**，直到满足 12.7 的多节点与 BAREX signal 条件；不得以单节点 world 测试替代跨节点验证。

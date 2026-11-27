@@ -27,6 +27,7 @@ import re
 from pathlib import Path
 from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
+from triton.runtime._distributed import DistributedRtContext
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import GPUDriver
 
@@ -220,13 +221,20 @@ def make_launcher(constants, signature, tensordesc_meta):
     expand_signature = _expand_signature(signature.values())
     signature = {i: s for i, s in enumerate(expand_signature)}
 
-    args_format = ''.join([format_of(ty) for ty in signature.values()])
-    format = _BASE_ARGS_FORMAT + args_format
-
     flat_signature = []
     for sig in signature.values():
         _flatten_signature(sig, flat_signature)
+    # flagtree tle distributed: the JIT prepends the two lite-mode runtime
+    # pointers when FLAGTREE_LITE_DIST is active.  Keep the launcher signature
+    # in sync with that call order.
+    if DistributedRtContext().is_lite_mode:
+        flat_signature.insert(0, "*i64")  # device_comm_ptr
+        flat_signature.insert(1, "*i64")  # device_mem_ptr
     signature = {i: s for i, s in enumerate(flat_signature)}
+    # Build the PyArg format after the lite-mode prefixes are inserted;
+    # otherwise PyArg_ParseTuple rejects the two extra JIT arguments.
+    args_format = ''.join([format_of(ty) for ty in signature.values()])
+    format = _BASE_ARGS_FORMAT + args_format
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for HGGC.
