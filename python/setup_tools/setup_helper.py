@@ -242,7 +242,10 @@ def finalize_backend_build_tree(build_lib):
 
 
 def enable_flagtree_third_party(name):
-    return os.environ.get(f"USE_{name.upper()}", 'ON') == 'ON'
+    # flagcx_ppu is a backend-local checkout of the same dependency; let the
+    # existing USE_FLAGCX switch govern both copies.
+    env_name = "flagcx" if name.startswith("flagcx") else name
+    return os.environ.get(f"USE_{env_name.upper()}", 'ON') == 'ON'
 
 
 def download_flagtree_third_party(name, condition, required=False, hook=None):
@@ -255,7 +258,8 @@ def download_flagtree_third_party(name, condition, required=False, hook=None):
                 hook_call(configs=configs, backend=submodule, cache=cache)
 
         else:
-            print(f"\033[1;33m[Note] Skip downloading {name} since USE_{name.upper()} is set to OFF\033[0m")
+            env_name = "flagcx" if name.startswith("flagcx") else name
+            print(f"\033[1;33m[Note] Skip downloading {name} since USE_{env_name.upper()} is set to OFF\033[0m")
 
 
 # FlagPrism: resolve its dependency through FlagTree's existing package helpers.
@@ -932,6 +936,12 @@ flagcx_wheel = PathFinder.find_spec("flagcx", sys.path)
 download_flagtree_third_party("flagcx", condition=not flagcx_wheel
                               and (flagtree_backend or "nvidia") in FLAGCX_SUPPORT_BACKENDS, hook="handle_flagcx",
                               required=True)
+
+# PPU uses a backend-local FlagCX checkout: its Device IR bitcode postdates the
+# shared flagcx pin. FLAGCX_MODULE_PATH still wins for preinstalled bundles.
+download_flagtree_third_party("flagcx_ppu",
+                              condition=(flagtree_backend == "ppu") and not os.environ.get("FLAGCX_MODULE_PATH"),
+                              hook="handle_flagcx_ppu", required=True)
 
 download_flagtree_third_party("cuda-tile", condition=(flagtree_backend == "tileir"), required=True)
 

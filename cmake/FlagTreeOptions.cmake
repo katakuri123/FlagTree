@@ -43,7 +43,10 @@ macro(flagtree_configure_options)
   endif()
 
   set(FLAGCX_ENABLED OFF)
-  set(FLAGCX_SUPPORT_BACKENDS nvidia iluvatar)
+  # ppu carries its own FlagCX checkout (third_party/ppu/third_party/flagcx);
+  # the shared `flagcx` pin used by the other communication backends is
+  # intentionally left unchanged.
+  set(FLAGCX_SUPPORT_BACKENDS nvidia iluvatar ppu)
   if(NOT FLAGTREE_BACKEND OR
      "${FLAGTREE_BACKEND}" IN_LIST FLAGCX_SUPPORT_BACKENDS)
     add_compile_definitions(FLAGCX_ENABLED)

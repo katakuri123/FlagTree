@@ -105,6 +105,12 @@ third_party/nvidia/backend/lib/cupti
 third_party/nvidia/backend/tileir_cuda/
 third_party/tileir/third_party/
 third_party/tle/third_party
+third_party/ppu/third_party
+third_party/ppu/backend/flagcx_wrapper.py
+third_party/ppu/backend/include/
+third_party/ppu/backend/lib/libflagcx_device.bc
+third_party/ppu/backend/lib/metadata.json
+third_party/ppu/backend/lib/.flagcx_ppu_build_stamp
 
 # third_party sunrise
 third_party/sunrise/backend/lib/*.bc

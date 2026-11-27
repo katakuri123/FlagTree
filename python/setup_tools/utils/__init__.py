@@ -69,6 +69,14 @@ submodule_registrar = SubmoduleRegistrar(submodules=(
         "commit_id": "c93438decaba8d935e7aa6ae8377e56fd3910b32"
     },
     {
+        # PPU needs the `bindings/ir/ppu` Device IR bitcode, which the shared
+        # `flagcx` pin does not provide.  Keep this checkout separate so the
+        # NVIDIA/Iluvatar/HCU communication backends keep their validated
+        # FlagCX revision.
+        "name": "flagcx_ppu", "url": "https://github.com/flagos-ai/FlagCX.git", "relative_path":
+        "ppu/third_party/flagcx", "commit_id": "4879b88dafb631cef9361cc7eae5b0449d5b63ac"
+    },
+    {
         "name": "cuda-tile", "url": "https://github.com/NVIDIA/cuda-tile.git", "relative_path":
         "tileir/third_party/cuda-tile", "commit_id": "7e8e2e68fa219716103824c01f7303367cf7df8d"
     },
