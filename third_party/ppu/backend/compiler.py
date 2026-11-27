@@ -181,10 +181,19 @@ def get_ppu_llc_version():
     return version
 
 
-@functools.lru_cache(None)
-def file_hash(path):
+@functools.lru_cache(maxsize=64)
+def _file_hash_cached(path, mtime_ns, size, inode):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+def file_hash(path):
+    # Key the cache on file identity/stat instead of path alone: rebuilding a
+    # FlagCX bitcode in place must change HGGCOptions.hash() and invalidate
+    # the Triton compile cache within a long-running process.
+    stat = os.stat(path)
+    return _file_hash_cached(os.path.realpath(path), stat.st_mtime_ns,
+                             stat.st_size, stat.st_ino)
 
 
 def sm_arch_from_capability(capability: int):
@@ -241,6 +250,7 @@ class HGGCOptions:
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
+    lite_dist: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -253,6 +263,10 @@ class HGGCOptions:
         extern_libs.update(Distributed().get_extern_libs())
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
+        # Lite mode changes the kernel ABI (two implicit runtime pointers), so
+        # it must participate in the compile-cache key.  The JIT only enables
+        # it when FLAGTREE_LITE_DIST is set and a context has been created.
+        object.__setattr__(self, 'lite_dist', DistributedRtContext().is_lite_mode)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
                "num_warps must be a power of 2"
 
@@ -396,7 +410,7 @@ class PPUBackend(BaseBackend):
             # Fuse node-space copies before conversion so pointer provenance
             # still refers to the original function argument ordinals.
             tle.passes.add_fuse_node_remote_transfers(pm)
-            if DistributedRtContext().is_lite_mode:
+            if opt.lite_dist:
                 tle.passes.add_params_for_distribution(pm)
         passes.ttir.add_convert_to_ttgpuir(pm, f"ppu:{capability}", opt.num_warps, 32, opt.num_ctas)
         if tle is not None:

@@ -37,6 +37,7 @@ verified on PPU SDK 2.1.0:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -122,6 +123,69 @@ def _bitcode_path(source: Path, arch: str) -> Path:
     return _bitcode_dir(source, arch) / "lib" / _BC_NAME
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_headers(include_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for header in sorted(include_dir.glob("*.h")):
+        digest.update(header.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(header.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _sdk_version(home: Path) -> str:
+    release = home / "release.yaml"
+    if release.is_file():
+        for line in release.read_text().splitlines():
+            if line.strip().startswith("version:"):
+                return line.split(":", 1)[1].strip()
+    magic = home / "VERSION.txt"
+    if magic.is_file():
+        return magic.read_text().strip()
+    return "unknown"
+
+
+def _bitcode_target(bitcode: Path, home: Path) -> tuple[str, str]:
+    """Read the bitcode's triple/datalayout from the first lines of llvm-dis."""
+    llvm_dis = home / "bin" / "llvm-dis"
+    if not llvm_dis.is_file():
+        return "unknown", "unknown"
+    proc = subprocess.Popen([str(llvm_dis), "-o", "-", str(bitcode)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True)
+    head = []
+    try:
+        for _ in range(6):
+            line = proc.stdout.readline()
+            if not line:
+                break
+            head.append(line)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    triple = "unknown"
+    datalayout = "unknown"
+    for line in head:
+        if line.startswith("target triple"):
+            triple = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("target datalayout"):
+            datalayout = line.split("=", 1)[1].strip().strip('"')
+    return triple, datalayout
+
+
 def _stamp_text(source: Path, arch: str) -> str:
     return ("flagcx_commit={}\narch={}\n"
             "flags=USE_PPU=1 USE_ACCL_BAREX=1 USE_UCX=0 COMPILE_KERNEL=1\n").format(_source_revision(source), arch)
@@ -155,6 +219,16 @@ class PPUFlagCXRegistrar:
         return (self.stamp_path.read_text() == expected and _host_lib(self.source).is_file()
                 and _bitcode_path(self.source, self.arch).is_file() and self.installed_shared.is_file()
                 and self.installed_bitcode.is_file())
+
+    def _metadata_ready(self) -> bool:
+        metadata_path = self.installed_bitcode.parent / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, ValueError):
+            return False
+        required = ("metadata_version", "flagcx_commit", "arch", "target_triple",
+                    "host_library_sha256", "device_bitcode_sha256", "headers_sha256")
+        return all(key in metadata for key in required)
 
     def _build(self) -> None:
         if not self.source.is_dir():
@@ -205,20 +279,30 @@ class PPUFlagCXRegistrar:
         shutil.copy2(host_lib, self.installed_shared)
         shutil.copy2(bitcode, self.installed_bitcode)
 
-        metadata = {
-            "backend": self.backend_name,
-            "arch": self.arch,
-            "flagcx_commit": _source_revision(self.source),
-            "host_library": _SO_NAME,
-            "device_bitcode": _BC_NAME,
-        }
-        (self.installed_bitcode.parent / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-
         wrapper = self.source / "src" / "flagcx" / "api.py"
         if not wrapper.is_file():
             wrapper = self.source / "plugin" / "interservice" / "flagcx_wrapper.py"
         if not wrapper.is_file():
             raise PPUFlagCXError(f"FlagCX Python wrapper not found under {self.source}")
+
+        target_triple, target_datalayout = _bitcode_target(bitcode, self.home)
+        metadata = {
+            "metadata_version": 1,
+            "backend": self.backend_name,
+            "arch": self.arch,
+            "target_triple": target_triple,
+            "target_datalayout": target_datalayout,
+            "sdk_version": _sdk_version(self.home),
+            "build_flags": "USE_PPU=1 USE_ACCL_BAREX=1 USE_UCX=0 COMPILE_KERNEL=1",
+            "flagcx_commit": _source_revision(self.source),
+            "host_library": _SO_NAME,
+            "device_bitcode": _BC_NAME,
+            "host_library_sha256": _sha256_file(host_lib),
+            "device_bitcode_sha256": _sha256_file(bitcode),
+            "headers_sha256": _sha256_headers(include_dir),
+            "wrapper_sha256": _sha256_file(wrapper),
+        }
+        (self.installed_bitcode.parent / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
         language_dir = self.flagtree_dir / "python" / "triton" / "experimental" / "tle" / "language"
         backend_dir = self.flagtree_dir / "third_party" / self.backend_name / "backend"
@@ -240,6 +324,10 @@ class PPUFlagCXRegistrar:
 
     def run(self) -> None:
         if self._artifacts_ready():
+            if not self._metadata_ready():
+                _info("refreshing FlagCX PPU metadata from existing artifacts")
+                self._install()
+                return
             _info("FlagCX PPU artifacts are up to date; skipping rebuild "
                   "(set FLAGCX_RECOMPILE=1 to force)")
             return

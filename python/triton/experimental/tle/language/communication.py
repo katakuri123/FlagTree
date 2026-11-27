@@ -198,6 +198,11 @@ def init_communicator():
     global comm, rank, _init_communicator_
     if enabled and _init_communicator_:
         return
+    # Backends may defer environment setup until the communicator is created
+    # (PPU does), keeping compile-only imports free of runtime side effects.
+    apply_env = getattr(flagcx_rt_conf, "apply_runtime_env", None)
+    if apply_env is not None:
+        apply_env()
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
