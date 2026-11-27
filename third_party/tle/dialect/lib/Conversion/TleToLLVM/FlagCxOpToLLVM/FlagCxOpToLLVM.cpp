@@ -43,7 +43,7 @@ void populateFlagCxOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
   mlir::triton::tle::populateGetWorldRankOpToLLVMPatterns(
       typeConverter, patterns, benefit, ptrAddressSpace);
   mlir::triton::tle::populateFlagCxBarrierOpToLLVMPatterns(
-      typeConverter, patterns, benefit, ptrAddressSpace);
+      typeConverter, patterns, benefit, ptrAddressSpace, collectiveFence);
   mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(
       typeConverter, patterns, benefit, ptrAddressSpace, collectiveFence);
 #endif

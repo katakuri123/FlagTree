@@ -180,7 +180,9 @@ def _cleanup_flagcx_allocator_wrapper():
 
 
 def cleanup_communicator():
-    global comm, rank, dev_mem, dev_comm, win
+    global comm, rank, dev_mem, dev_comm, win, _init_communicator_
+    if not _init_communicator_:
+        return
     dist.barrier()
     flagcx.flagcxDevMemFreeDevicePtr(dev_mem)
     flagcx.flagcxDevCommFreeDevicePtr(dev_comm)
@@ -191,7 +193,13 @@ def cleanup_communicator():
     flagcx.flagcxCommDestroy(comm)
 
     dist.destroy_process_group()
-    print(f"[Rank {rank}] Done")
+    done_rank = rank
+    comm = None
+    dev_mem = None
+    dev_comm = None
+    win = None
+    _init_communicator_ = False
+    print(f"[Rank {done_rank}] Done")
 
 
 def init_communicator():

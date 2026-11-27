@@ -30,6 +30,12 @@ _GPU_TARGET = GPUTarget("cuda", 80, 32)
 
 
 @triton.jit
+def _signal_inter_only(out, ctx: tl.constexpr, peer: tl.constexpr):
+    tle.signal(ctx, peer, slot_id=0, op="inc", space="inter_node", group_kind="block")
+    tl.store(out, 1)
+
+
+@triton.jit
 def _signal_block_only(out, ctx: tl.constexpr, peer: tl.constexpr):
     tle.signal(ctx, peer, slot_id=0, op="inc", space="intra_node", group_kind="block")
     tl.store(out, 1)
@@ -45,7 +51,7 @@ def _signal_thread_only(out, ctx: tl.constexpr, peer: tl.constexpr):
 def _signal_wait_ops(out, ctx: tl.constexpr, peer: tl.constexpr):
     tle.signal(ctx, peer, slot_id=0, op="inc", space="intra_node", group_kind="block")
     tle.signal(ctx, peer, slot_id=1, value=2, op="add", space="intra_node", group_kind="block")
-    tle.signal(ctx, peer, slot_id=2, op="inc", space="inter_node", group_kind="block")
+    tle.signal(ctx, peer, slot_id=2, op="inc", space="intra_node", group_kind="block")
     tle.signal(ctx, peer, slot_id=3, op="inc", space="world", group_kind="block")
     tle.signal(ctx, peer, slot_id=6, op="inc", space="intra_node", group_kind="warp", scope="device")
     tle.signal_wait(ctx, slot_id=0, wait_kind="signal", target=1, group_kind="block", order="acquire")
@@ -93,6 +99,11 @@ def test_signal_wait_lowering_reaches_as0_device_calls():
     assert "ppu.atom.add.acq_rel.sys" in llir
     assert "ppu.fence.sc.sys" in llir
     assert "hgbin" in compiled.asm
+
+
+def test_signal_inter_space_is_rejected():
+    with pytest.raises(NotImplementedError, match=r"space='inter'"):
+        _compile_fn(_signal_inter_only)
 
 
 def test_collective_signal_emits_system_fence():

@@ -36,11 +36,14 @@ using namespace mlir::triton;
 struct FlagCxBarrierOpConversion
     : public ConvertOpToLLVMPattern<tle::FlagCxBarrierOp> {
   FlagCxBarrierOpConversion(LLVMTypeConverter &typeConverter,
-                            PatternBenefit benefit, unsigned ptrAddressSpace)
+                            PatternBenefit benefit, unsigned ptrAddressSpace,
+                            bool collectiveFence)
       : ConvertOpToLLVMPattern(typeConverter, benefit),
-        ptrAddressSpace(ptrAddressSpace) {}
+        ptrAddressSpace(ptrAddressSpace),
+        collectiveFence(collectiveFence) {}
 
   unsigned ptrAddressSpace;
+  bool collectiveFence;
 
   LogicalResult
   matchAndRewrite(tle::FlagCxBarrierOp op, OpAdaptor adaptor,
@@ -53,7 +56,7 @@ struct FlagCxBarrierOpConversion
         static_cast<int32_t>(op.getCoopKind()),
         static_cast<int32_t>(op.getOrder()),
         static_cast<int32_t>(op.getScope()),
-        op.getBarrierTypeAttr().getValue(), ptrAddressSpace);
+        op.getBarrierTypeAttr().getValue(), ptrAddressSpace, collectiveFence);
     rewriter.eraseOp(op);
     return success();
   }
@@ -63,7 +66,7 @@ struct FlagCxBarrierOpConversion
 
 void mlir::triton::tle::populateFlagCxBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit, unsigned ptrAddressSpace) {
+    PatternBenefit benefit, unsigned ptrAddressSpace, bool collectiveFence) {
   patterns.add<FlagCxBarrierOpConversion>(typeConverter, benefit,
-                                          ptrAddressSpace);
+                                          ptrAddressSpace, collectiveFence);
 }

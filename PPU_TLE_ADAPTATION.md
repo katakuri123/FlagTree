@@ -727,6 +727,248 @@ Phase 6 Go/No-Go 前置条件：
 ### 12.8 Phase 5 Go/No-Go 结论
 
 - **5.1 FlagCX space barrier：Go**。可直接复用现有 FlagCxBarrier lowering、AS0 参数化与双卡通信上下文；风险低。
-- **5.2 PPU grid barrier：Conditional Go**。算法与 PPU 原子能力具备，但必须先补齐 TLE global scratch 分配/清零管线并验证 cooperative launch 驻留；未完成前不得开放 grid barrier。
+- **5.2 PPU grid barrier：Conditional Go**。算法与 PPU 原子能力具备，但必须先补齐 TLE global scratch 分配/清零管线并验证 cooperative launch 驻留；未完成前不得开放 grid barrier。注：12.6 的部分预估已被 13.9 的实测修正（PPU 已有 scratch 分配 pass，共享 PTX 计数形式可被当前 SDK 接受；真正阻塞是 scratch 清零、cooperative 标志传播与 occupancy 校验）。
 - **5.3 cluster/submesh：No-Go（本阶段）**。PPU cluster 语义未验证，显式拒绝。
 - **Phase 6：No-Go**，直到满足 12.7 的多节点与 BAREX signal 条件；不得以单节点 world 测试替代跨节点验证。
+
+## 13. Phase 5.1：PPU TLE Distributed Barrier — FlagCX Space Barrier
+
+### 13.1 目标、范围与结论
+
+本阶段只开放 `tle.distributed_barrier` 的 **FlagCX Space Barrier** 路径：
+
+- `space="device"`（FlagCX INTRA team）与单节点 `space="world"`（FlagCX WORLD team）。
+- 合法 barrier 形式：`sync` / `arrive` / `wait`。
+- `group_kind="block"`；`group_kind="warp"` 仅在 `num_warps=1`（整个 CTA 只有一个 warp）时开放。
+- `barrier_index` 0–7、`context_id` 0–3。
+- 线程组 `thread` 因缺少单线程执行掩码，运行时 **UNVERIFIED**，编译期拒绝。
+- 显式不开放：`space="inter"`、多节点 `space="world"`、grid/grid_axis、cluster/submesh，以及未经验证的 Lite-mode TLE。
+
+结论：**Phase 5.1 Go**。2/4/8 卡、4096 轮设备侧 barrier、1M 元素 payload、sync/arrive/wait、index/context、错峰到达、重复轮次、normal/`.cg`/volatile 读取均通过；未进入 NVIDIA grid barrier 路径，未引入 NVIDIA PTX 依赖。
+
+### 13.2 调用链与 lowering
+
+```
+tle.distributed_barrier(mesh, device_dptr=ctx, space="device"|"world",
+                        barrier_kind="sync"|"arrive"|"wait",
+                        group_kind="block"|"warp",
+                        index=i, context_id=c, order=..., memory_scope=...)
+  -> tle.distributed_barrier op
+  -> tle.flagcx.barrier op (FlagCxBarrierOp)
+  -> flagcxDevBarrierSync / flagcxDevBarrierArrive / flagcxDevBarrierWait
+     (teamKind = INTRA(0) / WORLD(2), coopKind = BLOCK(2) / WARP(1))
+  -> FlagCX device inline: intra epoch inbox；world 在单节点退化为 intra，
+     多节点才走 inter FIFO/proxy signal（本阶段未开放）
+```
+
+关键点：
+
+- PPU 的 FlagCX Device IR 使用**泛型 AS0 指针**。PPU lowering 调用 `populateFlagCx*OpToLLVMPatterns(..., ptrAddressSpace=0, collectiveFence=true)`；LLIR 中 barrier 参数由 `inttoptr (i64 ...)` 构造，**不出现** `addrspacecast`。
+- Space barrier 不经过 `DistributedBarrierOpToLLVM` 的 grid/cluster 分支；该共享 pattern 只在 `FLAGCX_ENABLED` 下注册，space barrier 实际由 `FlagCxBarrierOp` 消费。
+- `memory_scope` 与 `order` 被传递到 FlagCX Device API，但见 13.4 的有效语义说明。
+
+### 13.3 代码修改
+
+| 文件 | 修改 |
+|---|---|
+| `third_party/ppu/backend/tle_supported.py` | 将 `distributed_barrier` 加入 PPU 支持列表 |
+| `third_party/ppu/backend/compiler.py` | `reject_unsupported_tle` 增加 barrier space/group/index/context 门控；`_runtime_is_multi_node` 拓扑判定；`HGGCOptions.dist_multi_node` 与 `tle_gate_version` 进入编译缓存 key；`file_hash` 对刚修改文件绕过 stat 缓存，避免同尺寸快速重写的陈旧 hash |
+| `python/src/ir.cc` | 新增 `Operation.get_int_attr`，供门控读取 `barrier_index`/`context_id`/`team_kind` |
+| `third_party/tle/dialect/include/Tools/FlagcxUtils.h`、`lib/Tools/FlagcxUtils.cpp` | `getUnifiedBarrierFuncCall` 增加 `collectiveFence`；非 THREAD group 在 arrive/sync 前、wait/sync 后发射 `ppu.fence.sc.sys` |
+| `FlagCxBarrierOpToLLVM.h/.cpp`、`FlagCxOpToLLVM.cpp` | 将 `collectiveFence` 从 umbrellas 传入 barrier pattern；保留其他后端默认值（AS1、无 fence） |
+| `third_party/ppu/lib/TritonPPUGPUToLLVM/TritonGPUToLLVM.cpp` | 注册 `populateDistributedBarrierOpToLLVMPatterns`；FlagCx patterns 以 AS0 + collective fence 调用 |
+| `python/triton/experimental/tle/language/communication.py` | `cleanup_communicator` 幂等化：未初始化直接返回；销毁后清空 comm/dev_mem/dev_comm/win 并复位 `_init_communicator_` |
+| `third_party/ppu/python/test/unit/tle/test_tle_signal_compile.py` | 适配 Phase 5.1 的 inter signal 门控：inter 编译用例改为拒绝用例 |
+| `test_tle_barrier_compile.py`、`test_tle_barrier_space.py/.sh` | 新增编译级与 2/4/8 卡运行级覆盖 |
+
+### 13.4 能力门控矩阵
+
+| 条件 | 结果 | 依据 |
+|---|---|---|
+| `space="device"` + `group_kind="block"` | **SUPPORTED** | 2/4/8 卡运行验证，含 4096 轮与 1M payload |
+| `space="device"` + `group_kind="warp"` + `num_warps=1` | **SUPPORTED** | 单 warp CTA 即一个 warp cooperative；运行验证 |
+| `space="device"` + `group_kind="warp"` + `num_warps>1` | **UNVERIFIED，编译拒绝** | 多个 warp 会共享同一 epoch slot，FlagCX 未提供 warp 级隔离 |
+| `space="device"` + `group_kind="thread"` | **UNVERIFIED，编译拒绝** | 需要“每个 barrier index 恰好一个线程执行”；TLE 当前无 thread-id 掩码 |
+| `space="world"` + `group_kind="block"` + 单节点 | **SUPPORTED** | 2/4/8 卡运行验证（sync/arrive/wait、index/context） |
+| `space="world"` + `group_kind="warp"/"thread"` | **UNVERIFIED，编译拒绝** | world barrier 组合 intra+inter；单节点时 `_nInterPeers==0` 会退化为 intra，但该 net 字段是运行期状态，无法在编译期证明不会走 inter。inter 的 signal increment/shadow 只对 block coop 有锁步保证，因此只开放已验证的 block |
+| `space="world"` + 多节点 | **UNSUPPORTED，编译拒绝** | `WORLD_SIZE != LOCAL_WORLD_SIZE`；多节点环境未提供 |
+| `space="inter"` | **UNSUPPORTED，编译拒绝** | 跨节点 FlagCX inter team 未验证 |
+| `group_kind="grid"` / `grid_axis` / space=None | **UNSUPPORTED（Phase 5.1）** | grid barrier 未开放；TLE op verifier 对 `group_kind="grid"` 先报诊断，PPU 门控对 `space=None` 再拒绝 |
+| `index` 不在 0–7 | **编译拒绝** | `create_dist_tensor` 申请 `barrierCount=8` |
+| `context_id` 不在 0–3 | **编译拒绝** | `interContextCount=4` |
+| FlagCX 不可用 | **编译拒绝** | `Distributed().is_available` |
+| Lite-mode TLE | **UNVERIFIED** | 沿用 Phase 4.5 结论，不在本阶段开放 |
+
+拓扑门控细节：
+
+- `world` 仅当可证明单节点时允许：`WORLD_SIZE<=1`（仅编译/单 rank）或 `LOCAL_WORLD_SIZE==WORLD_SIZE`。
+- 多 rank 运行若缺少 `LOCAL_WORLD_SIZE`，无法证明单节点，按多节点/UNVERIFIED 拒绝。
+- `HGGCOptions.dist_multi_node` 参与 `hash()`，防止单节点编译产物在多节点启动时被缓存复用。
+- Triton 的磁盘缓存查找发生在 `make_ttir`/`reject_unsupported_tle` **之前**；因此 `tle_gate_version` 也参与 `hash()`。修改 gate 策略时必须递增 `PPU_TLE_GATE_VERSION`，否则旧缓存仍可能被复用而绕过新门控。本次调试中一次“绕过 gate 的探针编译”即污染了 `_barrier_grid` 缓存，加版本号后测试恢复，说明该约束是实际存在的。
+
+### 13.5 内存序与 FlagCX 行为核实
+
+FlagCX `flagcxDevBarrier<Intra>` 的实际实现（`default_comm_traits.h`）：
+
+- `arrive`：先 `_coop.sync()`，再由 **striped 线程**向每个 peer 的 inbox 写 `epoch+1`（release）。
+- `wait`：striped 线程 acquire 轮询 peer inbox，更新 epoch，threadRank 0 写 epoch buffer，最后 `_coop.sync()`。
+- `sync = arrive + wait`。
+
+因此存在 leader/striped-only 的释放/获取缺口：非 striped 线程的 payload 写入/读取不由这些 release/acquire 排序。PPU 的修正：
+
+- `collectiveFence && coopKind != THREAD` 时，在 `arrive`/`sync` 调用前发射每线程 `ppu.fence.sc.sys`；在 `wait`/`sync` 调用后再次发射。
+- 该 fence 使每个线程的 payload store 在 barrier 发布前可见，并使 wait 返回后的 load 有序。
+- `thread` group 在 FlagCX 中每个线程执行全部 peer 操作，本不需要额外 fence；但 barrier 的 thread group 已被 13.4 门控拒绝。
+
+FlagCX API 参数的有效性：
+
+- `flagcxDevBarrier*` 的 `scope` 形参被 `(void)scope` **忽略**。
+- intra barrier 的 `order` 形参也未参与内部 atomic：`arrive` 固定 `Release` store，`wait` 固定 `Acquire` load；epoch buffer 使用 `Release`。
+- world/inter barrier 的 signal 操作同样固定使用 release/acquire 语义；`order`/`scope` 不改变 wire 行为。
+- 需要特别指出：`Barrier<World>` 组合 intra+inter；单节点 world team 的 `_nInterPeers==0`，`sync()` 实际退化为 intra barrier；多节点才会执行 inter signal/wait 后再做 intra broadcast。本阶段只开放单节点 world，但由于 `_nInterPeers` 是运行期 net 字段，门控仍只允许已验证的 block coop。
+- 因此 PPU 上的有效语义是 **system-scope release/acquire（强于 relaxed）**，而不是用户传入的任意 `order`/`memory_scope`。本阶段保留参数兼容，但文档明确其不生效；需要 relaxed barrier 的用户不能依赖参数含义。
+
+编译级证据（`test_tle_barrier_compile.py`）：
+
+- 三个 device API 符号均出现：`flagcxDevBarrierSync/Arrive/Wait`。
+- `inttoptr (i64 ...)` 存在，`addrspacecast` 不存在。
+- 无 `atom.add.release.gpu.u32` / `ld.acquire.gpu.u32`（space 路径不走 NVIDIA grid PTX）。
+- block/warp barrier 的 LLIR 有 `ppu.fence.sc.sys`；thread-only 用例在门控处被拒绝。
+- 产物为 `hgbin`。
+
+### 13.6 可见性：normal / `.cg` / volatile
+
+运行测试在每轮 barrier 后读取上一 Rank 的 payload：
+
+| 读取方式 | 配置 | 结果 |
+|---|---|---|
+| `volatile=True` | 2/4/8 卡，4096 轮 × 2 barrier，N=64 | PASS |
+| `volatile=True` | 2/4/8 卡，1M 元素 payload，4 轮 | PASS |
+| `volatile=True` | world block、arrive/wait、index/context、错峰到达 | PASS |
+| `volatile=False`（normal） | 2/4/8 卡，4096 轮，N=64 | PASS |
+| `volatile=False` + `cache_modifier=".cg"` | 2/4/8 卡，8 轮，N=256 | PASS |
+
+结论：
+
+- **barrier 路径未复现 normal load 陈旧问题**。原因是 intra `wait` 末尾有 `_coop.sync()`，随后所有线程执行 `ppu.fence.sc.sys`；获取由 striped 线程完成后经 CTA 同步传播到全部线程。Phase 4.5 的 signal 路径不同：`signal_wait` 的 leader-only 轮询返回后没有 group sync，非 leader 线程的 normal load 可能命中陈旧缓存，因此 signal/remote 仍要求 `volatile=True`。
+- 因此不能把“normal load 一定失效”认定为 PPU 后端缺陷；更准确的结论是：**signal/wait 的 leader-only 路径需要 volatile 或额外的 group rendezvous，barrier 路径已具备 rendezvous**。为保守起见，跨 Rank 轮询仍推荐 `volatile=True`，尤其 signal；barrier 后读取在现有证据下 normal/`.cg` 也可用。
+- 本阶段未修改 normal load 的 cache policy，也未实现 remote-load 自动 invalidate；这属于后续优化/后端语义工作。
+
+### 13.7 测试矩阵与结果
+
+编译级（`pytest -q test_tle_barrier_compile.py`）：**11 passed**
+
+覆盖：device sync block、device arrive/wait warp（`num_warps=1`）、world sync block、index=7/context=3 上界、inter 拒绝、invalid group（verifier 诊断）、index=8 拒绝、context=4 拒绝、thread 拒绝、warp `num_warps=4` 拒绝、world warp 拒绝、world 多节点拓扑拒绝、grid/space=None 拒绝。
+
+运行级（`test_tle_barrier_space.sh`，每 Rank 一个 CTA）：
+
+| 卡数 | 参数 | 结果 | 耗时 |
+|---|---|---|---|
+| 2 | `BARRIER_ROUNDS=64 BARRIER_LONG_ROUNDS=4096 BARRIER_LONG_N=64` | **PASS**（2/2 Rank ALL PASS） | 59s |
+| 4 | 同上 | **PASS**（4/4） | 65s |
+| 8 | 同上 | **PASS**（8/8） | 93s |
+
+配置覆盖：
+
+- device block：`num_warps=1/2/4`。
+- device warp：`num_warps=1`。
+- device `arrive` + `wait` 分离。
+- device `index=1/context=1`，`index=7/context=3`。
+- world block sync、world arrive/wait、world `index=1/context=1`。
+- 错峰到达（Rank 0 无延迟，Rank i 延迟 `i*2000` 次 volatile load）。
+- normal load 8 轮观察、`.cg` 8 轮观察、normal load 4096 轮观察。
+- 4096 轮纯设备侧循环，每轮两次 barrier，Host 只在配置之间同步。
+- 1M float payload（4 轮）。
+- 结束处重复调用 `cleanup_communicator()`，验证幂等释放。
+
+全量回归：
+
+| 测试 | 结果 |
+|---|---|
+| PPU TLE 单测 `pytest -q third_party/ppu/python/test/unit/tle/` | **175 passed, 5 skipped, 1 xfailed** |
+| 2 卡 signal/wait 矩阵 | **PASS** |
+| 2 卡 signal ping-pong（4096 轮、1M、warp/thread、star） | **PASS** |
+| 4 卡 ping-pong（1024 轮） | **PASS** |
+| 8 卡 ping-pong（512 轮） | **PASS** |
+| 2 卡 remote intra-node | **PASS** |
+| 2 卡 shard_id | **PASS** |
+| 普通 Triton vector add + row reduction | **PASS** |
+| Phase 5.1 clean build | 见下方构建记录 |
+
+构建：
+
+- Phase 5.1 C++ 增量构建 `build-phase51.log`：**EXIT=0**。
+- 修改 FlagCX wrapper/metadata 后重新执行 `pip install -e . --no-build-isolation`：**EXIT=0**，ABI hash 刷新后编译测试通过。
+- 最终 clean build：`rm -rf build && FLAGTREE_BACKEND=ppu pip install -e . --no-build-isolation`，日志 `/data/wenxuekun/flagtree-phase1/build-phase51-clean.log`，**EXIT=0**（541 个编译/链接目标；确认无增量缓存依赖）。
+- clean build 后复跑：barrier 2/4/8 卡分别 **61s / 62s / 94s，全部 PASS**；全量 PPU TLE 单测 **175 passed, 5 skipped, 1 xfailed**；2 卡 signal/wait 与 ping-pong 均 **PASS**。
+
+### 13.8 通信器 release / re-init 结论
+
+- `cleanup_communicator()` 已改为幂等：重复调用直接返回；销毁后复位 `comm/dev_mem/dev_comm/win/_init_communicator_`。运行测试在末尾调用两次并检查 `dist.is_initialized()==False`，通过。
+- **re-init 未开放**。调查结果：
+  - 2 Rank、少量 barrier 轮次的最小探针有时可以通过；但在完整测试序列或 4 Rank 下，`cleanup -> flagcxCommInitRank` 会在 FlagCX/ACCL/NCCL bootstrap 阶段出现 `double free or corruption` / SIGABRT。
+  - 触发与 barrier 轮数、world barrier 使用、Rank 数相关，但即使 device-only 4 Rank 也会复现；这是 FlagCX/NCCL bootstrap 与 ACCL 线程池 teardown 的竞争，不是 barrier lowering 的内存错误。
+  - 尝试在 cleanup 中调用 `flagcxCommFinalize`（FlagCX 测试的 canonical teardown）改善了部分 2 Rank 场景，但未修复 4 Rank；且该 API 绑定位于被主仓库 ignore 的 FlagCX 生成 wrapper 中，无法以可复现方式提交，故已回退。
+- 结论：Phase 5.1 只承诺 **release/重复 release 安全**；同进程 destroy -> re-init 标记为 **UNVERIFIED/外部限制**，默认测试不包含重初始化，避免把 FlagCX teardown 竞争误判为 barrier 回归。后续如需要，应单独与 FlagCX 上游协调 bootstrap/ACCL 生命周期。
+
+### 13.9 Phase 5.2 预研（不实现）
+
+本节为预研结论，**未修改 gate，也未开放 grid/grid_axis**。方法：在 `/tmp` 探针中临时绕过 PPU 门控（仅进程内 monkeypatch，不改源码），复用共享 `DistributedBarrierOpToLLVM` 的 grid 路径，运行最小 kernel。
+
+#### 13.9.1 已有能力与实测
+
+- **编译**：`tle.distributed_barrier(mesh)` 的 grid 路径在 PPU 上可以直接编译出 `hgbin`；LLIR 中保留共享 lowering 的 `atom.add.release.gpu.u32` / `ld.acquire.gpu.u32` inline asm，PPU `ppu-llc` 接受这些字符串。`global_scratch_size=4`、`global_scratch_align=4`。说明 12.6 中“必须新增 TLE scratch pass / 必须替换为 PPU 原子”的判断过于保守：PPU 已有 `add_allocate_global_scratch_memory`，共享 lowering 的 PTX 形式在当前 SDK 可被接受。
+- **运行**：
+  - 2 CTA，一次 grid barrier，barrier 后读取 peer：**PASS**。
+  - 8 CTA，16 轮、每轮两次 grid barrier，non-cooperative 与 `launch_cooperative_grid=True`：均 **PASS**。
+  - 64 CTA，8 轮，cooperative：**PASS**。
+  - grid_axis：4 CTA / group=2、8 CTA / group=4，cooperative 与 non-cooperative 的 8 轮测试：均 **PASS**；两个 barrier 站点 scratch 为 2×groups×4 字节（例如 4 CTA/group2 为 16 字节）。
+- **算法**：共享 lowering 使用 4 字节 sense-reversing 计数器（高 bit flip），每个 CTA 的 thread 0 到达，其余线程经 CTA barrier 等待；grid_axis 为每个 disjoint group 分配独立 4 字节计数器。4 字节足够覆盖 CTA 数量（上限 2^31），当前不需要 64 位原子；PPU 32 位原子可用。
+
+#### 13.9.2 必须先解决的问题
+
+1. **Cooperative launch 标志未传播到 metadata（阻塞性）**
+   - 前端 `_apply_mesh_grid_launch` 在 semantic lowering 期间把 `options.launch_cooperative_grid=True`；但 `triton.compile` 的 metadata 字典在调用 `make_ir` **之前**已由 `options.__dict__` 快照生成。
+   - 因此默认 grid barrier kernel 的 `metadata.launch_cooperative_grid` 实测为 **False**；只有显式传入该 option 时才为 True。
+   - NVIDIA backend 在 `make_ttir` 中显式执行 `metadata["launch_cooperative_grid"] = opt.launch_cooperative_grid`（`third_party/nvidia/backend/compiler.py:474` 注释即说明 frontend 会修改该 option）；PPU 缺少这一步。Phase 5.2 必须补上。
+2. **缺少驻留/occupancy 校验（阻塞性）**
+   - 原子 grid barrier 要求所有参与 CTA 同时驻留；否则自旋等待会死锁。
+   - PPU driver 已有 `HG_LAUNCH_ATTRIBUTE_COOPERATIVE` 路径，SDK 提供 `hggcOccupancyMaxActiveBlocksPerMultiprocessor`、`hggcOccupancyMaxPotentialBlockSize`、`hggcDevAttrCooperativeLaunch`；当前 driver 只有 cluster occupancy helper（固定 blockDim=128），没有 cooperative grid 的 `maxActiveBlocksPerSM × SM count` 检查。
+   - Phase 5.2 应在 launcher 启动前计算并校验 `grid <= occupancy`，超限时报明确错误；`num_ctas>1` / cluster 组合显式拒绝。
+3. **global scratch 必须清零（阻塞性）**
+   - PPU driver 在每次 launch 用 `allocate_scratch` 调用户 allocator 分配 `grid_size * num_ctas * scratch_size`，但 **不做 memset**；用户 allocator 通常返回 `torch.empty`。
+   - 预研中把 scratch 填成 `0x7f` 后，8 CTA / 8 轮探针 **超时挂起**；清零（或至少低 31 位为 0）后通过。说明共享 grid barrier 协议依赖初始计数器为 0（或等价状态），不能直接使用脏 scratch。
+   - 方案：launch 前对 barrier scratch 做清零（例如 allocator 返回后 `zero_()`，或专用 memset）；或改造协议为带 generation/epoch、可容忍任意初值。前者最小、风险低，建议 Phase 5.2 先做。
+4. **Allocator 前置条件**
+   - 没有 `triton.set_allocator(...)` 时，带 global scratch 的 kernel 直接报错（`Kernel requires a runtime memory allocation...`）。Phase 5.2 需要文档化该要求，或为 PPU 提供默认 allocator（注意生命周期与 stream 顺序）。
+5. **并发/多 stream**
+   - 每次 launch 都调用 allocator 分配独立 scratch，理论上并发 stream 各自持有独立计数器；但要求 allocator 是 stream-ordered 且 buffer 在 kernel 完成前存活。尚未做同 kernel 双 stream 并发验证，Phase 5.2 应补。
+6. **grid vs grid_axis 计划**
+   - 先开放 whole-grid `grid`（无 group descriptor，scratch=4 字节/站点）；验证后再开放 `grid_axis`（`mesh.axis_group(...)`，scratch=groups×4/站点）。
+   - 两者共用 `lowerGridBarrier`；风险主要在 scratch 清零、cooperative 驻留和 group descriptor 验证，而非 lowering 本身。
+
+#### 13.9.3 最小实现计划（Phase 5.2）
+
+1. 在 PPU `make_ttir` 中回填 `metadata["launch_cooperative_grid"]`（对齐 NVIDIA），确保 frontend 的 mesh grid 设置生效。
+2. 在 PPU driver/launcher 增加 cooperative occupancy 校验：查询 `hggcOccupancyMaxActiveBlocksPerMultiprocessor` 与 SM 数，grid 超限时拒绝；cluster/num_ctas>1 组合拒绝。
+3. launch 前清零 global scratch（或实现 generation 协议）；补 allocator 默认/文档；验证脏内存、连续 launch、双 stream。
+4. 只对 PPU 重新开放 `group_kind="grid"` 的 gate，先写 1/2/4/8/64 CTA、1–4096 轮、payload 可见性、超时测试；稳定后再开放 `grid_axis`。
+5. 更新能力矩阵与测试；cluster/submesh 继续 No-Go。
+
+#### 13.9.4 Phase 5.2 Go/No-Go
+
+- **Grid barrier：Conditional Go**。共享 lowering、PPU PTX 接受度、4 字节计数器、per-launch scratch 均已被探针证实；但必须完成 13.9.2 的 1–4 项（coop 元数据、occupancy、scratch 清零、allocator）后才可开放，否则存在死锁/挂起风险。
+- **grid_axis：Conditional Go（第二阶段）**。探针已通过 group=2/4 的 4/8 CTA 测试，但应在 whole-grid 稳定后开放，并补 group descriptor/多 group 并发测试。
+- **cluster/submesh：No-Go（本阶段）**。PPU cluster 语义未验证，继续保持拒绝。
+- **Phase 6：No-Go**，条件不变（见 12.7）。
+
+### 13.10 限制汇总
+
+- Space barrier 是 **team barrier**，不是 grid barrier：一个 barrier index 在每个 Rank 上应只由一个 cooperative unit 使用；block group 要求每个 Rank 一个 CTA 参与，多 CTA 不会形成 grid-wide 同步（Phase 5.2 处理）。
+- `group_kind="thread"` 与 `group_kind="warp"`（`num_warps>1`）在 PPU 上编译拒绝；warp 只在单 warp CTA 下验证。
+- world 仅单节点、block group；inter/多节点 world 未验证并拒绝。
+- FlagCX barrier 忽略 `order`/`scope`，有效为 system-scope release/acquire；不能依参数获得 relaxed 语义。
+- barrier 后 normal/`.cg` load 在现有测试中可见，但 signal/remote 仍要求 `volatile=True`；跨 Rank 轮询建议继续使用 volatile。
+- 同进程 destroy -> re-init 未开放（FlagCX/ACCL teardown 竞争）。
+- 未验证：多 CTA per Rank、grid>1、cluster/submesh、多节点 inter/world、Lite-mode TLE barrier、与 CUDA Graph/多 stream 的组合。
+- P2P buffer 环境约束、`FLAGCX_P2P_BUFFER_SIZE/CHUNK_SIZE` 与设备占用限制沿用 Phase 4.5。

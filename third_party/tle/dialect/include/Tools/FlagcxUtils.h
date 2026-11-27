@@ -53,7 +53,7 @@ LLVM::CallOp getUnifiedBarrierFuncCall(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     int32_t teamKind, int32_t barrierIndex, int32_t contextId, int32_t coopKind,
     int32_t order, int32_t scope, llvm::StringRef barrierType,
-    unsigned ptrAddressSpace = 1);
+    unsigned ptrAddressSpace = 1, bool collectiveFence = false);
 
 LLVM::CallOp getSignalFuncCall(mlir::Location loc,
                                ConversionPatternRewriter &rewriter, Value comm,

@@ -8,6 +8,7 @@ TLE_SUPPORTED_PRIMITIVES = [
     "remote",
     "signal",
     "signal_wait",
+    "distributed_barrier",
     "load",
     "extract_tile",
     "insert_tile",

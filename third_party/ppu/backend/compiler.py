@@ -35,6 +35,7 @@ from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
 import hashlib
 import re
+import time
 import tempfile
 import os
 import subprocess
@@ -49,7 +50,6 @@ from pathlib import Path
 PPU_UNSUPPORTED_TLE_OPS = {
     "ttg.warp_specialize": "tle.warp_specialize",
     "ttg.tma_copy": "tle.gpu.copy.tensor_descriptor",
-    "tle.distributed_barrier": "tle.distributed_barrier",
 }
 
 # Remote pointers are lowered for intra-node device space in Phase 3.  Node
@@ -57,8 +57,37 @@ PPU_UNSUPPORTED_TLE_OPS = {
 # and chiplet spaces have no PPU semantics.
 PPU_SUPPORTED_REMOTE_SPACES = {"device"}
 
+# Phase 5.1 supports the FlagCX team barrier for device and single-node world
+# spaces.  Inter-node, grid/grid_axis and cluster/submesh barriers stay gated.
+PPU_SUPPORTED_BARRIER_SPACES = {"device", "world"}
+# Mirrors create_dist_tensor(): 8 intra/inter barriers and 4 network contexts.
+PPU_FLAGCX_BARRIER_COUNT = 8
+PPU_FLAGCX_CONTEXT_COUNT = 4
+# Bump when the TLE capability policy changes.  The gate runs after Triton's
+# compile-cache lookup, so this token must participate in HGGCOptions.hash()
+# or a kernel cached under an older policy would bypass the new gate.
+PPU_TLE_GATE_VERSION = 1
 
-def reject_unsupported_tle(mod):
+
+def _runtime_is_multi_node() -> bool:
+    try:
+        world = int(os.environ.get("WORLD_SIZE", "0") or 0)
+        local = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+    except ValueError:
+        return False
+    # world <= 1 is compile-only or a single rank: world space is single-node.
+    if world <= 1:
+        return False
+    # A multi-rank runtime that does not publish LOCAL_WORLD_SIZE cannot be
+    # proven single-node, so treat world space as multi-node/UNVERIFIED.
+    if local <= 0:
+        return True
+    return world != local
+
+
+def reject_unsupported_tle(mod, multi_node=None, num_warps=None):
+    if multi_node is None:
+        multi_node = _runtime_is_multi_node()
     features = set()
 
     # mod.walk takes a void callback and cannot be interrupted from Python, so
@@ -69,6 +98,59 @@ def reject_unsupported_tle(mod):
             space = op.get_str_attr("space")
             if space not in PPU_SUPPORTED_REMOTE_SPACES:
                 features.add(f"tle.remote(space={space!r})")
+            return
+        if name == "tle.distributed_barrier":
+            space = op.get_str_attr("space")
+            if not Distributed().is_available:
+                features.add("tle.distributed_barrier (FlagCX disabled)")
+            elif space not in PPU_SUPPORTED_BARRIER_SPACES:
+                features.add(f"tle.distributed_barrier(space={space!r})")
+            elif space == "world" and multi_node:
+                features.add("tle.distributed_barrier(space='world') on multi-node")
+            else:
+                group_kind = op.get_str_attr("group_kind")
+                if group_kind is not None and group_kind not in ("thread", "warp", "block"):
+                    features.add(f"tle.distributed_barrier(group_kind={group_kind!r})")
+                # FlagCX barrier indices share one epoch slot per rank, so a
+                # thread-group call must be made by exactly one thread and a
+                # warp-group call by exactly one warp.  TLE has no thread-id
+                # mask in this phase; a one-warp CTA is the only provable warp
+                # grouping.  Thread-group runtime use is UNVERIFIED.
+                elif group_kind == "thread":
+                    features.add(
+                        "tle.distributed_barrier(group_kind='thread') is UNVERIFIED "
+                        "(one-thread masking is unavailable)")
+                elif group_kind == "warp" and num_warps != 1:
+                    features.add(
+                        f"tle.distributed_barrier(group_kind='warp') requires num_warps=1, got {num_warps}")
+                # The world/inter net barrier signals peers with non-idempotent
+                # signal increments and a shared shadow counter that is not
+                # atomically updated.  Only a block-wide cooperative keeps one
+                # waiter per peer and lockstep rounds; warp is UNVERIFIED.
+                elif space == "world" and group_kind not in (None, "block"):
+                    features.add(
+                        f"tle.distributed_barrier(space='world', group_kind={group_kind!r}) is UNVERIFIED")
+                index = op.get_int_attr("barrier_index")
+                if index is not None and not 0 <= index < PPU_FLAGCX_BARRIER_COUNT:
+                    features.add(f"tle.distributed_barrier(index={index})")
+                context_id = op.get_int_attr("context_id")
+                if context_id is not None and not 0 <= context_id < PPU_FLAGCX_CONTEXT_COUNT:
+                    features.add(f"tle.distributed_barrier(context_id={context_id})")
+            return
+        if name == "tle.signal":
+            team_kind = op.get_int_attr("team_kind")
+            if team_kind == 1:  # FlagCXTeamKind::INTER
+                features.add("tle.signal(space='inter')")
+            elif team_kind == 2 and multi_node:  # WORLD
+                features.add("tle.signal(space='world') on multi-node")
+            context_id = op.get_int_attr("context_id")
+            if context_id is not None and not 0 <= context_id < PPU_FLAGCX_CONTEXT_COUNT:
+                features.add(f"tle.signal(context_id={context_id})")
+            return
+        if name == "tle.signal_wait":
+            context_id = op.get_int_attr("context_id")
+            if context_id is not None and not 0 <= context_id < PPU_FLAGCX_CONTEXT_COUNT:
+                features.add(f"tle.signal_wait(context_id={context_id})")
             return
         feature = PPU_UNSUPPORTED_TLE_OPS.get(name)
         if feature is not None:
@@ -192,6 +274,13 @@ def file_hash(path):
     # FlagCX bitcode in place must change HGGCOptions.hash() and invalidate
     # the Triton compile cache within a long-running process.
     stat = os.stat(path)
+    # Filesystems may expose a coarser timestamp than a same-size in-place
+    # rewrite.  Do not trust the stat-keyed cache for a file that was just
+    # modified; stable installed artifacts (libdevice, FlagCX bitcode) still
+    # avoid re-hashing on every compile.
+    if stat.st_mtime_ns >= time.time_ns() - 10_000_000_000:
+        with open(os.path.realpath(path), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
     return _file_hash_cached(os.path.realpath(path), stat.st_mtime_ns,
                              stat.st_size, stat.st_ino)
 
@@ -251,6 +340,10 @@ class HGGCOptions:
     arch: str = None
     instrumentation_mode: str = ""
     lite_dist: bool = False
+    # Runtime topology participates in the cache key so a world-space kernel
+    # compiled on a single node is never reused on a multi-node launch.
+    dist_multi_node: bool = False
+    tle_gate_version: int = PPU_TLE_GATE_VERSION
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -267,6 +360,8 @@ class HGGCOptions:
         # it must participate in the compile-cache key.  The JIT only enables
         # it when FLAGTREE_LITE_DIST is set and a context has been created.
         object.__setattr__(self, 'lite_dist', DistributedRtContext().is_lite_mode)
+        object.__setattr__(self, 'dist_multi_node', _runtime_is_multi_node())
+        object.__setattr__(self, 'tle_gate_version', PPU_TLE_GATE_VERSION)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
                "num_warps must be a power of 2"
 
@@ -380,7 +475,7 @@ class PPUBackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, opt, capability):
-        reject_unsupported_tle(mod)
+        reject_unsupported_tle(mod, opt.dist_multi_node, opt.num_warps)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)

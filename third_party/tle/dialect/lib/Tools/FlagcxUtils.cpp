@@ -114,11 +114,14 @@ LLVM::CallOp getWorldRankFuncCall(mlir::Location loc,
       FlatSymbolRefAttr::get(func), ValueRange{commDevPtr});
 }
 
+static void emitPpuSystemFence(Location loc,
+                               ConversionPatternRewriter &rewriter);
+
 LLVM::CallOp getUnifiedBarrierFuncCall(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     int32_t teamKind, int32_t barrierIndex, int32_t contextId, int32_t coopKind,
     int32_t order, int32_t scope, llvm::StringRef barrierType,
-    unsigned ptrAddressSpace) {
+    unsigned ptrAddressSpace, bool collectiveFence) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
@@ -150,10 +153,23 @@ LLVM::CallOp getUnifiedBarrierFuncCall(
   auto coopKindVal = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, coopKind);
   auto orderVal = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, order);
   auto scopeVal = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, scope);
-  return rewriter.create<LLVM::CallOp>(
+
+  // FlagCX's collective barrier is executed by a subset of threads (the
+  // leader in block/warp groups).  Publish prior payload stores before the
+  // barrier and acquire peer writes afterwards for every thread.
+  const bool needsFence = collectiveFence &&
+                          coopKind != static_cast<int32_t>(FlagCXCoopKind::THREAD);
+  const bool fenceBefore = needsFence && (barrierType == "arrive" || barrierType == "sync");
+  const bool fenceAfter = needsFence && (barrierType == "wait" || barrierType == "sync");
+  if (fenceBefore)
+    emitPpuSystemFence(loc, rewriter);
+  auto call = rewriter.create<LLVM::CallOp>(
       loc, func,
       ValueRange{commDevPtr, teamKindVal, barrierIndexVal, contextIdVal,
                  coopKindVal, orderVal, scopeVal});
+  if (fenceAfter)
+    emitPpuSystemFence(loc, rewriter);
+  return call;
 }
 
 LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,

@@ -52,6 +52,7 @@
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/PatternTleToLLVM.h"
 #ifdef FLAGCX_ENABLED
+#include "tle/dialect/include/Conversion/TleToLLVM/DistributedBarrierOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/FlagCxOpToLLVM/FlagCxOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/NodeTransferOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/SignalOpToLLVM.h"
@@ -317,6 +318,11 @@ struct ConvertTritonGPUToLLVMPPU
       mlir::triton::tle::populateExclusiveCumsumOpToLLVMPatterns(
           typeConverter, targetInfo, tlePatterns, benefit);
 #ifdef FLAGCX_ENABLED
+      // Space barriers lower to tle.flagcx barrier and then to the shared
+      // FlagCX Device API.  The compiler guard admits only the verified
+      // device/world space path.
+      mlir::triton::tle::populateDistributedBarrierOpToLLVMPatterns(
+          typeConverter, tlePatterns, benefit);
       mlir::triton::tle::populateSignalOpToLLVMPatterns(typeConverter,
                                                         tlePatterns, benefit);
       // PPU's FlagCX Device IR exports generic (AS0) pointers; the shared
