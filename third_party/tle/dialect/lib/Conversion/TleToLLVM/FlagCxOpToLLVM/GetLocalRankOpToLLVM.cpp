@@ -45,8 +45,11 @@ using namespace mlir::triton;
 
 struct GetNumPesOpConversion : public ConvertOpToLLVMPattern<tle::GetNumPesOp> {
   GetNumPesOpConversion(LLVMTypeConverter &typeConverter,
-                        PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
+                        PatternBenefit benefit, unsigned ptrAddressSpace)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        ptrAddressSpace(ptrAddressSpace) {}
+
+  unsigned ptrAddressSpace;
 
   LogicalResult
   matchAndRewrite(tle::GetNumPesOp op, OpAdaptor adaptor,
@@ -57,7 +60,8 @@ struct GetNumPesOpConversion : public ConvertOpToLLVMPattern<tle::GetNumPesOp> {
     };
     auto loc = op.getLoc();
     auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    auto getLocalPeCall = tle::getNumPesFunCall(loc, rewriter, srcElems[0]);
+    auto getLocalPeCall =
+        tle::getNumPesFunCall(loc, rewriter, srcElems[0], ptrAddressSpace);
 
     Value nPes = getLocalPeCall.getResult();
     if (!nPes.getType().isInteger(32))
@@ -70,8 +74,11 @@ struct GetNumPesOpConversion : public ConvertOpToLLVMPattern<tle::GetNumPesOp> {
 struct GetLocalRankOpConversion
     : public ConvertOpToLLVMPattern<tle::GetLocalRankOp> {
   GetLocalRankOpConversion(LLVMTypeConverter &typeConverter,
-                           PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
+                           PatternBenefit benefit, unsigned ptrAddressSpace)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        ptrAddressSpace(ptrAddressSpace) {}
+
+  unsigned ptrAddressSpace;
 
   LogicalResult
   matchAndRewrite(tle::GetLocalRankOp op, OpAdaptor adaptor,
@@ -82,7 +89,8 @@ struct GetLocalRankOpConversion
     };
     auto loc = op.getLoc();
     auto comm = op.getSrc();
-    auto getLocalPeCall = tle::getLocalPeFuncCall(loc, rewriter, comm);
+    auto getLocalPeCall =
+        tle::getLocalPeFuncCall(loc, rewriter, comm, ptrAddressSpace);
 
     Value localPe = getLocalPeCall.getResult();
     if (!localPe.getType().isInteger(32))
@@ -95,12 +103,16 @@ struct GetLocalRankOpConversion
 } // namespace
 void tle::populateGetLocalRankOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                                RewritePatternSet &patterns,
-                                               PatternBenefit benefit) {
-  patterns.add<GetLocalRankOpConversion>(typeConverter, benefit);
+                                               PatternBenefit benefit,
+                                               unsigned ptrAddressSpace) {
+  patterns.add<GetLocalRankOpConversion>(typeConverter, benefit,
+                                         ptrAddressSpace);
 }
 
 void tle::populateGetNumPesOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                             RewritePatternSet &patterns,
-                                            PatternBenefit benefit) {
-  patterns.add<GetNumPesOpConversion>(typeConverter, benefit);
+                                            PatternBenefit benefit,
+                                            unsigned ptrAddressSpace) {
+  patterns.add<GetNumPesOpConversion>(typeConverter, benefit,
+                                      ptrAddressSpace);
 }

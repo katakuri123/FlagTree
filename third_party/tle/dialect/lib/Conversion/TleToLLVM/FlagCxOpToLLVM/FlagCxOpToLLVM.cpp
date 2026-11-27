@@ -30,20 +30,21 @@
 namespace mlir::triton::tle {
 void populateFlagCxOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                     RewritePatternSet &patterns,
-                                    PatternBenefit benefit) {
+                                    PatternBenefit benefit,
+                                    unsigned ptrAddressSpace) {
 #ifdef FLAGCX_ENABLED
   mlir::triton::tle::populateGetDeviceIdOpToFlagCxPatterns(typeConverter,
                                                            patterns, benefit);
-  mlir::triton::tle::populateGetLocalRankOpToLLVMPatterns(typeConverter,
-                                                          patterns, benefit);
-  mlir::triton::tle::populateGetNumPesOpToLLVMPatterns(typeConverter, patterns,
-                                                       benefit);
-  mlir::triton::tle::populateGetWorldRankOpToLLVMPatterns(typeConverter,
-                                                          patterns, benefit);
-  mlir::triton::tle::populateFlagCxBarrierOpToLLVMPatterns(typeConverter,
-                                                           patterns, benefit);
-  mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(typeConverter,
-                                                          patterns, benefit);
+  mlir::triton::tle::populateGetLocalRankOpToLLVMPatterns(
+      typeConverter, patterns, benefit, ptrAddressSpace);
+  mlir::triton::tle::populateGetNumPesOpToLLVMPatterns(
+      typeConverter, patterns, benefit, ptrAddressSpace);
+  mlir::triton::tle::populateGetWorldRankOpToLLVMPatterns(
+      typeConverter, patterns, benefit, ptrAddressSpace);
+  mlir::triton::tle::populateFlagCxBarrierOpToLLVMPatterns(
+      typeConverter, patterns, benefit, ptrAddressSpace);
+  mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(
+      typeConverter, patterns, benefit, ptrAddressSpace);
 #endif
 }
 

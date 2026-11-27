@@ -68,25 +68,27 @@ static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
 // before passing it to device/runtime functions.
 static inline Value getFlagcxMemOrCommPtr(mlir::Location loc,
                                           ConversionPatternRewriter &rewriter,
-                                          Value memPtrInt) {
+                                          Value memPtrInt,
+                                          unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
-  auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   return rewriter.create<LLVM::IntToPtrOp>(loc, ptrTy, memPtrInt);
 }
 
 LLVM::CallOp getNumPesFunCall(mlir::Location loc,
                               ConversionPatternRewriter &rewriter,
-                              Value memPtrInt) {
+                              Value memPtrInt, unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto PtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto PtrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto i32Ty = IntegerType::get(ctx, 32);
   auto func = createFuncInstance(
       runtimeNames.lookup("getNumPesFunction").data(), module, {PtrTy}, i32Ty);
 
-  auto comm_dev_ptr = getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt);
+  auto comm_dev_ptr =
+      getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt, ptrAddressSpace);
   return rewriter.create<LLVM::CallOp>(
       loc, TypeRange{func.getFunctionType().getReturnType()},
       FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
@@ -94,18 +96,19 @@ LLVM::CallOp getNumPesFunCall(mlir::Location loc,
 
 LLVM::CallOp getWorldRankFuncCall(mlir::Location loc,
                                   ConversionPatternRewriter &rewriter,
-                                  Value memPtrInt) {
+                                  Value memPtrInt, unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto i32Ty = IntegerType::get(ctx, 32);
   auto func =
       createFuncInstance(runtimeNames.lookup("getWorldRankFunction").data(),
                          module, {ptrTy}, i32Ty);
 
-  auto commDevPtr = getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt);
+  auto commDevPtr =
+      getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt, ptrAddressSpace);
   return rewriter.create<LLVM::CallOp>(
       loc, TypeRange{func.getFunctionType().getReturnType()},
       FlatSymbolRefAttr::get(func), ValueRange{commDevPtr});
@@ -114,12 +117,13 @@ LLVM::CallOp getWorldRankFuncCall(mlir::Location loc,
 LLVM::CallOp getUnifiedBarrierFuncCall(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     int32_t teamKind, int32_t barrierIndex, int32_t contextId, int32_t coopKind,
-    int32_t order, int32_t scope, llvm::StringRef barrierType) {
+    int32_t order, int32_t scope, llvm::StringRef barrierType,
+    unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto i32Ty = IntegerType::get(ctx, 32);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
   StringRef funcName;
@@ -137,7 +141,8 @@ LLVM::CallOp getUnifiedBarrierFuncCall(
       runtimeNames.lookup(funcName).data(), module,
       {ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty}, voidTy);
 
-  auto commDevPtr = getFlagcxMemOrCommPtr(loc, rewriter, comm);
+  auto commDevPtr =
+      getFlagcxMemOrCommPtr(loc, rewriter, comm, ptrAddressSpace);
   auto teamKindVal = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, teamKind);
   auto barrierIndexVal =
       rewriter.create<LLVM::ConstantOp>(loc, i32Ty, barrierIndex);
@@ -153,17 +158,18 @@ LLVM::CallOp getUnifiedBarrierFuncCall(
 
 LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,
                                 ConversionPatternRewriter &rewriter,
-                                Value memPtrInt) {
+                                Value memPtrInt, unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto PtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto PtrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto i32Ty = IntegerType::get(ctx, 32);
   auto func = createFuncInstance(
       runtimeNames.lookup("getLocalPeFunction").data(), module, {PtrTy}, i32Ty);
 
-  auto comm_dev_ptr = getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt);
+  auto comm_dev_ptr =
+      getFlagcxMemOrCommPtr(loc, rewriter, memPtrInt, ptrAddressSpace);
   return rewriter.create<LLVM::CallOp>(
       loc, TypeRange{func.getFunctionType().getReturnType()},
       FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
@@ -174,16 +180,17 @@ LLVM::CallOp getSignalFuncCall(mlir::Location loc,
                                Value peer, Value slotId, Value value,
                                uint32_t contextId, FlagCXTeamKind teamKind,
                                FlagCXCoopKind coopKind, SignalOpKind signalOp,
-                               SyncScope scope) {
+                               SyncScope scope, unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto i32Ty = IntegerType::get(ctx, 32);
   auto i64Ty = IntegerType::get(ctx, 64);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
-  auto commPtr = getFlagcxMemOrCommPtr(loc, rewriter, comm);
+  auto commPtr =
+      getFlagcxMemOrCommPtr(loc, rewriter, comm, ptrAddressSpace);
 
   auto teamKindValue = rewriter.create<LLVM::ConstantOp>(
       loc, i32Ty, rewriter.getI32IntegerAttr(static_cast<int32_t>(teamKind)));
@@ -224,17 +231,19 @@ LLVM::CallOp getSignalFuncCall(mlir::Location loc,
 LLVM::CallOp getDevNetWaitFuncCallByKind(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     Value slot_id, SignalWaitKind wait_kind, std::optional<Value> target,
-    FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order) {
+    FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order,
+    unsigned ptrAddressSpace) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
 
-  auto PtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto PtrTy = LLVM::LLVMPointerType::get(ctx, ptrAddressSpace);
   auto I32Ty = IntegerType::get(ctx, 32);
   auto I64Ty = IntegerType::get(ctx, 64);
   auto VoidTy = LLVM::LLVMVoidType::get(ctx);
 
-  auto commPtr = getFlagcxMemOrCommPtr(loc, rewriter, comm);
+  auto commPtr =
+      getFlagcxMemOrCommPtr(loc, rewriter, comm, ptrAddressSpace);
   auto coop_kind_val = rewriter.create<LLVM::ConstantOp>(
       loc, I32Ty, rewriter.getI32IntegerAttr(static_cast<int32_t>(coop_kind)));
   auto contextIdValue = rewriter.create<LLVM::ConstantOp>(

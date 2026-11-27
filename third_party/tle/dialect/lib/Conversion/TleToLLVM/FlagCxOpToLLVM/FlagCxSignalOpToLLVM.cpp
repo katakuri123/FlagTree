@@ -36,7 +36,12 @@ namespace tle = mlir::triton::tle;
 
 struct FlagCxSignalOpConversion
     : public ConvertOpToLLVMPattern<tle::FlagCxSignalOp> {
-  using ConvertOpToLLVMPattern<tle::FlagCxSignalOp>::ConvertOpToLLVMPattern;
+  FlagCxSignalOpConversion(LLVMTypeConverter &typeConverter,
+                           PatternBenefit benefit, unsigned ptrAddressSpace)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        ptrAddressSpace(ptrAddressSpace) {}
+
+  unsigned ptrAddressSpace;
 
   LogicalResult
   matchAndRewrite(tle::FlagCxSignalOp op, OpAdaptor adaptor,
@@ -51,7 +56,8 @@ struct FlagCxSignalOpConversion
     tle::getSignalFuncCall(loc, rewriter, adaptor.getComm(), adaptor.getPeer(),
                            adaptor.getSlotId(), adaptor.getValue(), contextId,
                            adaptor.getTeamKind(), adaptor.getCoopKind(),
-                           adaptor.getSignalOp(), adaptor.getScope());
+                           adaptor.getSignalOp(), adaptor.getScope(),
+                           ptrAddressSpace);
     rewriter.eraseOp(op);
     return success();
   }
@@ -60,8 +66,11 @@ struct FlagCxSignalOpConversion
 struct FlagCxSignalWaitOpConversion
     : public ConvertOpToLLVMPattern<tle::FlagCxSignalWaitOp> {
   FlagCxSignalWaitOpConversion(LLVMTypeConverter &typeConverter,
-                               PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
+                               PatternBenefit benefit, unsigned ptrAddressSpace)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        ptrAddressSpace(ptrAddressSpace) {}
+
+  unsigned ptrAddressSpace;
 
   LogicalResult
   matchAndRewrite(tle::FlagCxSignalWaitOp op, OpAdaptor adaptor,
@@ -77,7 +86,7 @@ struct FlagCxSignalWaitOpConversion
 
     tle::getDevNetWaitFuncCallByKind(loc, rewriter, comm, slot_id, wait_kind,
                                      target, coop_kind, contextId,
-                                     adaptor.getOrder());
+                                     adaptor.getOrder(), ptrAddressSpace);
 
     rewriter.eraseOp(op);
     return success();
@@ -88,7 +97,9 @@ struct FlagCxSignalWaitOpConversion
 
 void mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit) {
-  patterns.add<FlagCxSignalOpConversion>(typeConverter, benefit);
-  patterns.add<FlagCxSignalWaitOpConversion>(typeConverter, benefit);
+    PatternBenefit benefit, unsigned ptrAddressSpace) {
+  patterns.add<FlagCxSignalOpConversion>(typeConverter, benefit,
+                                         ptrAddressSpace);
+  patterns.add<FlagCxSignalWaitOpConversion>(typeConverter, benefit,
+                                             ptrAddressSpace);
 }

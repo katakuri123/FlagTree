@@ -31,10 +31,12 @@ namespace mlir::triton::tle {
 
 void populateGetLocalRankOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                           RewritePatternSet &patterns,
-                                          PatternBenefit benefit);
+                                          PatternBenefit benefit,
+                                          unsigned ptrAddressSpace = 1);
 void populateGetNumPesOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        RewritePatternSet &patterns,
-                                       PatternBenefit benefit);
+                                       PatternBenefit benefit,
+                                       unsigned ptrAddressSpace = 1);
 } // namespace mlir::triton::tle
 
 #endif

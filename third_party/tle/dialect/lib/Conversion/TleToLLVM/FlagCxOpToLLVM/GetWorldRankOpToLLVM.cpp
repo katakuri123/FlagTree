@@ -36,15 +36,19 @@ using namespace mlir::triton;
 struct GetWorldRankOpConversion
     : public ConvertOpToLLVMPattern<tle::GetWorldRankOp> {
   GetWorldRankOpConversion(LLVMTypeConverter &typeConverter,
-                           PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
+                           PatternBenefit benefit, unsigned ptrAddressSpace)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        ptrAddressSpace(ptrAddressSpace) {}
+
+  unsigned ptrAddressSpace;
 
   LogicalResult
   matchAndRewrite(tle::GetWorldRankOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto srcElems = unpackLLElements(loc, adaptor.getInput(), rewriter);
-    auto worldRank = tle::getWorldRankFuncCall(loc, rewriter, srcElems[0]);
+    auto worldRank =
+        tle::getWorldRankFuncCall(loc, rewriter, srcElems[0], ptrAddressSpace);
     rewriter.replaceOp(op, worldRank.getResult());
     return success();
   }
@@ -54,6 +58,8 @@ struct GetWorldRankOpConversion
 
 void tle::populateGetWorldRankOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                                RewritePatternSet &patterns,
-                                               PatternBenefit benefit) {
-  patterns.add<GetWorldRankOpConversion>(typeConverter, benefit);
+                                               PatternBenefit benefit,
+                                               unsigned ptrAddressSpace) {
+  patterns.add<GetWorldRankOpConversion>(typeConverter, benefit,
+                                         ptrAddressSpace);
 }

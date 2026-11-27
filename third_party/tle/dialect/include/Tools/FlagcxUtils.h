@@ -36,31 +36,36 @@ using namespace mlir;
 
 LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,
                                 ConversionPatternRewriter &rewriter,
-                                Value memPtrInt);
+                                Value memPtrInt,
+                                unsigned ptrAddressSpace = 1);
 
 LLVM::CallOp getWorldRankFuncCall(mlir::Location loc,
                                   ConversionPatternRewriter &rewriter,
-                                  Value memPtrInt);
+                                  Value memPtrInt,
+                                  unsigned ptrAddressSpace = 1);
 
 LLVM::CallOp getNumPesFunCall(mlir::Location loc,
                               ConversionPatternRewriter &rewriter,
-                              Value memPtrInt);
+                              Value memPtrInt,
+                              unsigned ptrAddressSpace = 1);
 
 LLVM::CallOp getUnifiedBarrierFuncCall(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     int32_t teamKind, int32_t barrierIndex, int32_t contextId, int32_t coopKind,
-    int32_t order, int32_t scope, llvm::StringRef barrierType);
+    int32_t order, int32_t scope, llvm::StringRef barrierType,
+    unsigned ptrAddressSpace = 1);
 
 LLVM::CallOp getSignalFuncCall(mlir::Location loc,
                                ConversionPatternRewriter &rewriter, Value comm,
                                Value peer, Value slotId, Value value,
                                uint32_t contextId, FlagCXTeamKind teamKind,
                                FlagCXCoopKind coopKind, SignalOpKind signalOp,
-                               SyncScope scope);
+                               SyncScope scope, unsigned ptrAddressSpace = 1);
 
 LLVM::CallOp getDevNetWaitFuncCallByKind(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     Value slot_id, SignalWaitKind wait_kind, std::optional<Value> target,
-    FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order);
+    FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order,
+    unsigned ptrAddressSpace = 1);
 
 } // namespace mlir::triton::tle
