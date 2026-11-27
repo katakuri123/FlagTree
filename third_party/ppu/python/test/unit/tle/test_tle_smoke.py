@@ -219,7 +219,11 @@ def test_ppu_rejects_distributed_barrier_with_clear_error():
         )
     chain = _exception_chain(excinfo.value)
     full = str(excinfo.value) + "".join(str(c) for c in chain)
-    assert "tle.distributed_barrier" in full
+    # PPU does not advertise this primitive until the grid barrier lowering
+    # lands, so the whitelist (TLEUnsupportedPrimitiveError) rejects it before
+    # compilation.  Keep asserting that the failure names both the primitive
+    # and the backend, whichever layer reports it.
+    assert "distributed_barrier" in full
     assert "ppu" in full.lower()
 
 
