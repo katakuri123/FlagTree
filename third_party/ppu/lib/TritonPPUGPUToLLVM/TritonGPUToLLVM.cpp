@@ -322,7 +322,8 @@ struct ConvertTritonGPUToLLVMPPU
       // PPU's FlagCX Device IR exports generic (AS0) pointers; the shared
       // lowering defaults to NVIDIA's AS1.
       mlir::triton::tle::populateFlagCxOpToLLVMPatterns(
-          typeConverter, tlePatterns, benefit, /*ptrAddressSpace=*/0);
+          typeConverter, tlePatterns, benefit, /*ptrAddressSpace=*/0,
+          /*collectiveFence=*/true);
 #endif
       if (failed(
               applyPartialConversion(mod, tleTarget, std::move(tlePatterns)))) {

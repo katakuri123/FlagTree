@@ -42,35 +42,35 @@ BUFFER_ELEMS = LARGE_WB + LARGE_N
 def _read_contig(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs))
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
 
 
 @triton.jit
 def _read_strided(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs * 2))
+    tl.store(out + offs, tl.load(remote + offs * 2, volatile=True))
 
 
 @triton.jit
 def _read_masked(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs, mask=offs < BLOCK // 2, other=-7.0))
+    tl.store(out + offs, tl.load(remote + offs, mask=offs < BLOCK // 2, other=-7.0, volatile=True))
 
 
 @triton.jit
 def _read_int32(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.int32, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs))
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
 
 
 @triton.jit
 def _read_fp16(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float16, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs))
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
 
 
 @triton.jit
@@ -96,7 +96,7 @@ def _read_grid(out, ctx: tl.constexpr, peer: tl.constexpr, offset: tl.constexpr,
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=peer, offset=offset)
-    tl.store(out + offs, tl.load(remote + offs, mask=mask, other=-1.0), mask=mask)
+    tl.store(out + offs, tl.load(remote + offs, mask=mask, other=-1.0, volatile=True), mask=mask)
 
 
 @triton.jit

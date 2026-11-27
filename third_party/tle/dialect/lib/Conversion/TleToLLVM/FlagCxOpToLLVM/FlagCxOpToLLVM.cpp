@@ -31,7 +31,8 @@ namespace mlir::triton::tle {
 void populateFlagCxOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                     RewritePatternSet &patterns,
                                     PatternBenefit benefit,
-                                    unsigned ptrAddressSpace) {
+                                    unsigned ptrAddressSpace,
+                                    bool collectiveFence) {
 #ifdef FLAGCX_ENABLED
   mlir::triton::tle::populateGetDeviceIdOpToFlagCxPatterns(typeConverter,
                                                            patterns, benefit);
@@ -44,7 +45,7 @@ void populateFlagCxOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
   mlir::triton::tle::populateFlagCxBarrierOpToLLVMPatterns(
       typeConverter, patterns, benefit, ptrAddressSpace);
   mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(
-      typeConverter, patterns, benefit, ptrAddressSpace);
+      typeConverter, patterns, benefit, ptrAddressSpace, collectiveFence);
 #endif
 }
 

@@ -23,6 +23,10 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))
 LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
 if WORLD_SIZE <= 0 or LOCAL_WORLD_SIZE <= 0 or WORLD_SIZE % LOCAL_WORLD_SIZE:
     pytest.skip("torchrun with WORLD_SIZE/LOCAL_WORLD_SIZE is required", allow_module_level=True)
+if WORLD_SIZE != LOCAL_WORLD_SIZE:
+    pytest.skip("signal/wait runtime coverage is validated on a single node; "
+                "multi-node intra_node/world/inter_node paths are UNVERIFIED",
+                allow_module_level=True)
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
@@ -76,7 +80,26 @@ def _wait_read(out, ctx: tl.constexpr, sender: tl.constexpr, slot: tl.constexpr,
                     order="acquire")
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=sender, offset=0)
-    tl.store(out + offs, tl.load(remote + offs))
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
+
+
+@triton.jit
+def _produce_group(buf, data_value: tl.constexpr, ctx: tl.constexpr, peer: tl.constexpr,
+                   slot: tl.constexpr, unused: tl.constexpr, BLOCK: tl.constexpr,
+                   GROUP: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(buf + offs, tl.full((BLOCK, ), data_value, tl.float32))
+    tle.signal(ctx, peer, slot_id=slot, op="inc", space="intra_node", group_kind=GROUP)
+
+
+@triton.jit
+def _wait_read_group(out, ctx: tl.constexpr, sender: tl.constexpr, slot: tl.constexpr,
+                     target, BLOCK: tl.constexpr, GROUP: tl.constexpr):
+    tle.signal_wait(ctx, slot_id=slot, wait_kind="signal", target=target, group_kind=GROUP,
+                    order="acquire")
+    offs = tl.arange(0, BLOCK)
+    remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=sender, offset=0)
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
 
 
 @triton.jit
@@ -87,7 +110,7 @@ def _wait_read_multi(out, ctx: tl.constexpr, slot: tl.constexpr, target, BLOCK: 
     offs = tl.arange(0, BLOCK)
     for peer in tl.static_range(1, WORLD):
         remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=peer, offset=0)
-        tl.store(out + peer * BLOCK + offs, tl.load(remote + offs))
+        tl.store(out + peer * BLOCK + offs, tl.load(remote + offs, volatile=True))
 
 
 @triton.jit
@@ -110,7 +133,7 @@ def _wait_read_large(out, ctx: tl.constexpr, sender: tl.constexpr, slot: tl.cons
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=sender, offset=0)
     for start in range(0, N, BLOCK):
         mask = start + offs < N
-        values = tl.load(remote + start + offs, mask=mask, other=-1.0)
+        values = tl.load(remote + start + offs, mask=mask, other=-1.0, volatile=True)
         tl.store(out + start + offs, values, mask=mask)
 
 
@@ -130,7 +153,7 @@ def _wait_read_stress(out, ctx: tl.constexpr, sender: tl.constexpr, slot: tl.con
                     order="acquire")
     offs = tl.arange(0, BLOCK)
     remote = tle.remote(ctx, space="device", dtype=tl.float32, shard_id=sender, offset=0)
-    tl.store(out + offs, tl.load(remote + offs))
+    tl.store(out + offs, tl.load(remote + offs, volatile=True))
 
 
 def _check(name, got, expected, rank):
@@ -155,11 +178,24 @@ def test_signal_wait_matrix():
 
     out = torch.full((SMALL_N, ), -1.0, dtype=torch.float32, device="cuda")
 
-    def phase(name, producer, slot, target, value):
+    def phase(name, producer, slot, target, value, num_warps=4):
         data_value = rank * 1000 + value
         dist.barrier()
-        producer[(1, )](buf, data_value, ctx, peer, slot, value, SMALL_N, num_warps=4)
-        _wait_read[(1, )](out, ctx, sender, slot, target, SMALL_N, num_warps=4)
+        producer[(1, )](buf, data_value, ctx, peer, slot, value, SMALL_N, num_warps=num_warps)
+        _wait_read[(1, )](out, ctx, sender, slot, target, SMALL_N, num_warps=num_warps)
+        torch.cuda.synchronize()
+        expected = torch.full((SMALL_N, ), float(sender * 1000 + value), dtype=torch.float32,
+                              device="cuda")
+        _check(name, out, expected, rank)
+        dist.barrier()
+
+    def group_phase(name, group, slot, target, value, num_warps):
+        data_value = rank * 1000 + value
+        dist.barrier()
+        _produce_group[(1, )](buf, data_value, ctx, peer, slot, value, SMALL_N, group,
+                              num_warps=num_warps)
+        _wait_read_group[(1, )](out, ctx, sender, slot, target, SMALL_N, group,
+                                num_warps=num_warps)
         torch.cuda.synchronize()
         expected = torch.full((SMALL_N, ), float(sender * 1000 + value), dtype=torch.float32,
                               device="cuda")
@@ -171,6 +207,10 @@ def test_signal_wait_matrix():
     phase("inc_3", _produce_inc, 0, 3, 3)
     phase("add_3", _produce_add, 1, 3, 4)
     phase("world_inc", _produce_world_inc, 2, 1, 5)
+    phase("block_nw1", _produce_inc, 0, 4, 9, num_warps=1)
+    phase("block_nw2", _produce_inc, 0, 5, 10, num_warps=2)
+    group_phase("warp_group", "warp", 6, 4, 11, num_warps=4)
+    group_phase("thread_group", "thread", 7, 32, 12, num_warps=1)
 
     if WORLD_SIZE > 1:
         dist.barrier()

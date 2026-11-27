@@ -30,6 +30,18 @@ _GPU_TARGET = GPUTarget("cuda", 80, 32)
 
 
 @triton.jit
+def _signal_block_only(out, ctx: tl.constexpr, peer: tl.constexpr):
+    tle.signal(ctx, peer, slot_id=0, op="inc", space="intra_node", group_kind="block")
+    tl.store(out, 1)
+
+
+@triton.jit
+def _signal_thread_only(out, ctx: tl.constexpr, peer: tl.constexpr):
+    tle.signal(ctx, peer, slot_id=0, op="inc", space="intra_node", group_kind="thread")
+    tl.store(out, 1)
+
+
+@triton.jit
 def _signal_wait_ops(out, ctx: tl.constexpr, peer: tl.constexpr):
     tle.signal(ctx, peer, slot_id=0, op="inc", space="intra_node", group_kind="block")
     tle.signal(ctx, peer, slot_id=1, value=2, op="add", space="intra_node", group_kind="block")
@@ -43,14 +55,18 @@ def _signal_wait_ops(out, ctx: tl.constexpr, peer: tl.constexpr):
     tl.store(out, 1)
 
 
-def _compile():
+def _compile_fn(fn):
     ctx = DistributedRtContext(0x1000, 0x2000)
     source = triton.compiler.ASTSource(
-        fn=_signal_wait_ops,
+        fn=fn,
         signature={"out": "*i32", "ctx": "constexpr", "peer": "constexpr"},
         constexprs={"ctx": ctx, "peer": 1},
     )
     return triton.compile(source, target=_GPU_TARGET)
+
+
+def _compile():
+    return _compile_fn(_signal_wait_ops)
 
 
 def test_signal_primitives_are_declared_supported():
@@ -75,4 +91,23 @@ def test_signal_wait_lowering_reaches_as0_device_calls():
     # The inlined FlagCX signal uses PPU system-scope atomics.
     assert "ppu.atom.add.release.sys" in llir
     assert "ppu.atom.add.acq_rel.sys" in llir
+    assert "ppu.fence.sc.sys" in llir
     assert "hgbin" in compiled.asm
+
+
+def test_collective_signal_emits_system_fence():
+    if not _ppu_sdk_available():
+        pytest.skip("PPU SDK not available")
+    llir = _compile_fn(_signal_block_only).asm["llir"]
+    # The collective signal is emitted by one thread/lane; the per-thread
+    # system fence publishes the whole group's prior payload stores.
+    assert "ppu.fence.sc.sys" in llir
+
+
+def test_thread_group_signal_has_no_collective_fence():
+    if not _ppu_sdk_available():
+        pytest.skip("PPU SDK not available")
+    llir = _compile_fn(_signal_thread_only).asm["llir"]
+    # Every thread emits its own release signal, so no extra group fence.
+    assert "ppu.fence.sc.sys" not in llir
+    assert "ppu.atom.add.release.sys" in llir

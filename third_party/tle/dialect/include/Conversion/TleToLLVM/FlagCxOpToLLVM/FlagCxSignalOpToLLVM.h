@@ -32,7 +32,8 @@ namespace mlir::triton::tle {
 void populateFlagCxSignalOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                           RewritePatternSet &patterns,
                                           PatternBenefit benefit,
-                                          unsigned ptrAddressSpace = 1);
+                                          unsigned ptrAddressSpace = 1,
+                                          bool collectiveFence = false);
 
 } // namespace mlir::triton::tle
 

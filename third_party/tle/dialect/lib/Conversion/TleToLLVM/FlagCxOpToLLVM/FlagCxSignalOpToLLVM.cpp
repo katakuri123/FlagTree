@@ -37,11 +37,14 @@ namespace tle = mlir::triton::tle;
 struct FlagCxSignalOpConversion
     : public ConvertOpToLLVMPattern<tle::FlagCxSignalOp> {
   FlagCxSignalOpConversion(LLVMTypeConverter &typeConverter,
-                           PatternBenefit benefit, unsigned ptrAddressSpace)
+                           PatternBenefit benefit, unsigned ptrAddressSpace,
+                           bool collectiveFence)
       : ConvertOpToLLVMPattern(typeConverter, benefit),
-        ptrAddressSpace(ptrAddressSpace) {}
+        ptrAddressSpace(ptrAddressSpace),
+        collectiveFence(collectiveFence) {}
 
   unsigned ptrAddressSpace;
+  bool collectiveFence;
 
   LogicalResult
   matchAndRewrite(tle::FlagCxSignalOp op, OpAdaptor adaptor,
@@ -57,7 +60,7 @@ struct FlagCxSignalOpConversion
                            adaptor.getSlotId(), adaptor.getValue(), contextId,
                            adaptor.getTeamKind(), adaptor.getCoopKind(),
                            adaptor.getSignalOp(), adaptor.getScope(),
-                           ptrAddressSpace);
+                           ptrAddressSpace, collectiveFence);
     rewriter.eraseOp(op);
     return success();
   }
@@ -66,11 +69,14 @@ struct FlagCxSignalOpConversion
 struct FlagCxSignalWaitOpConversion
     : public ConvertOpToLLVMPattern<tle::FlagCxSignalWaitOp> {
   FlagCxSignalWaitOpConversion(LLVMTypeConverter &typeConverter,
-                               PatternBenefit benefit, unsigned ptrAddressSpace)
+                               PatternBenefit benefit, unsigned ptrAddressSpace,
+                               bool collectiveFence)
       : ConvertOpToLLVMPattern(typeConverter, benefit),
-        ptrAddressSpace(ptrAddressSpace) {}
+        ptrAddressSpace(ptrAddressSpace),
+        collectiveFence(collectiveFence) {}
 
   unsigned ptrAddressSpace;
+  bool collectiveFence;
 
   LogicalResult
   matchAndRewrite(tle::FlagCxSignalWaitOp op, OpAdaptor adaptor,
@@ -86,7 +92,8 @@ struct FlagCxSignalWaitOpConversion
 
     tle::getDevNetWaitFuncCallByKind(loc, rewriter, comm, slot_id, wait_kind,
                                      target, coop_kind, contextId,
-                                     adaptor.getOrder(), ptrAddressSpace);
+                                     adaptor.getOrder(), ptrAddressSpace,
+                                     collectiveFence);
 
     rewriter.eraseOp(op);
     return success();
@@ -97,9 +104,10 @@ struct FlagCxSignalWaitOpConversion
 
 void mlir::triton::tle::populateFlagCxSignalOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit, unsigned ptrAddressSpace) {
+    PatternBenefit benefit, unsigned ptrAddressSpace,
+    bool collectiveFence) {
   patterns.add<FlagCxSignalOpConversion>(typeConverter, benefit,
-                                         ptrAddressSpace);
+                                         ptrAddressSpace, collectiveFence);
   patterns.add<FlagCxSignalWaitOpConversion>(typeConverter, benefit,
-                                             ptrAddressSpace);
+                                             ptrAddressSpace, collectiveFence);
 }

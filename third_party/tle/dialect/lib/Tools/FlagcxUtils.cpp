@@ -175,12 +175,28 @@ LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,
       FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
 }
 
+// PPU's collective (block/warp) signal and wait are executed by one
+// thread/lane after a group sync.  The release/acquire atomic therefore does
+// not order the other threads' payload stores/loads, so each thread needs a
+// system fence around the collective operation.
+static void emitPpuSystemFence(Location loc,
+                               ConversionPatternRewriter &rewriter) {
+  auto ctx = rewriter.getContext();
+  LLVM::InlineAsmOp::create(
+      rewriter, loc, LLVM::LLVMVoidType::get(ctx), ValueRange{},
+      "ppu.fence.sc.sys;", "~{memory}", /*has_side_effects=*/true,
+      /*is_align_stack=*/false, LLVM::TailCallKind::None,
+      LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+      ArrayAttr::get(ctx, {}));
+}
+
 LLVM::CallOp getSignalFuncCall(mlir::Location loc,
                                ConversionPatternRewriter &rewriter, Value comm,
                                Value peer, Value slotId, Value value,
                                uint32_t contextId, FlagCXTeamKind teamKind,
                                FlagCXCoopKind coopKind, SignalOpKind signalOp,
-                               SyncScope scope, unsigned ptrAddressSpace) {
+                               SyncScope scope, unsigned ptrAddressSpace,
+                               bool collectiveFence) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
@@ -222,6 +238,12 @@ LLVM::CallOp getSignalFuncCall(mlir::Location loc,
     llvm_unreachable("unknown signal operation");
   }
 
+  if (collectiveFence && coopKind != FlagCXCoopKind::THREAD) {
+    // The release atomic only orders the issuing thread's stores; fence every
+    // thread before the group sync so the whole payload is visible.
+    emitPpuSystemFence(loc, rewriter);
+  }
+
   auto signalFunc =
       createFuncInstance(runtimeName.data(), module, argTypes, voidTy);
   return rewriter.create<LLVM::CallOp>(
@@ -232,7 +254,7 @@ LLVM::CallOp getDevNetWaitFuncCallByKind(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     Value slot_id, SignalWaitKind wait_kind, std::optional<Value> target,
     FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order,
-    unsigned ptrAddressSpace) {
+    unsigned ptrAddressSpace, bool collectiveFence) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
@@ -258,6 +280,7 @@ LLVM::CallOp getDevNetWaitFuncCallByKind(
                                          FlatSymbolRefAttr::get(func), args);
   };
 
+  LLVM::CallOp call;
   switch (wait_kind) {
   case SignalWaitKind::COUNTER:
     // Unified: (comm, counter, least, bits, contextId, coopKind, order)
@@ -265,27 +288,36 @@ LLVM::CallOp getDevNetWaitFuncCallByKind(
         runtimeNames.lookup("waitCounterFunction").data(), module,
         {PtrTy, I32Ty, I64Ty, I32Ty, I32Ty, I32Ty, I32Ty}, VoidTy);
     bits = rewriter.create<LLVM::ConstantOp>(loc, I32Ty, 56);
-    return make_call(ValueRange{commPtr, slot_id, target.value(), bits,
+    call = make_call(ValueRange{commPtr, slot_id, target.value(), bits,
                                 contextIdValue, coop_kind_val, orderValue});
+    break;
   case SignalWaitKind::SIGNAL:
     // Unified: (comm, signal, least, bits, contextId, coopKind, order)
     func = createFuncInstance(
         runtimeNames.lookup("waitSignalFunction").data(), module,
         {PtrTy, I32Ty, I64Ty, I32Ty, I32Ty, I32Ty, I32Ty}, VoidTy);
     bits = rewriter.create<LLVM::ConstantOp>(loc, I32Ty, 64);
-    return make_call(ValueRange{commPtr, slot_id, target.value(), bits,
+    call = make_call(ValueRange{commPtr, slot_id, target.value(), bits,
                                 contextIdValue, coop_kind_val, orderValue});
+    break;
   case SignalWaitKind::SHADOW:
     // Unified: (comm, contextId, signal, bits, coopKind, order)
     func = createFuncInstance(
         runtimeNames.lookup("waitShadowFunction").data(), module,
         {PtrTy, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty}, VoidTy);
     bits = rewriter.create<LLVM::ConstantOp>(loc, I32Ty, 64);
-    return make_call(ValueRange{commPtr, contextIdValue, slot_id, bits,
+    call = make_call(ValueRange{commPtr, contextIdValue, slot_id, bits,
                                 coop_kind_val, orderValue});
+    break;
   default:
     llvm_unreachable("unknown wait kind");
   }
+  if (collectiveFence && coop_kind != FlagCXCoopKind::THREAD) {
+    // Only the group leader performs the acquire; fence every thread after
+    // the group sync so the following payload loads observe the peer writes.
+    emitPpuSystemFence(loc, rewriter);
+  }
+  return call;
 }
 
 } // namespace mlir::triton::tle

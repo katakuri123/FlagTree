@@ -60,12 +60,13 @@ LLVM::CallOp getSignalFuncCall(mlir::Location loc,
                                Value peer, Value slotId, Value value,
                                uint32_t contextId, FlagCXTeamKind teamKind,
                                FlagCXCoopKind coopKind, SignalOpKind signalOp,
-                               SyncScope scope, unsigned ptrAddressSpace = 1);
+                               SyncScope scope, unsigned ptrAddressSpace = 1,
+                               bool collectiveFence = false);
 
 LLVM::CallOp getDevNetWaitFuncCallByKind(
     mlir::Location loc, ConversionPatternRewriter &rewriter, Value comm,
     Value slot_id, SignalWaitKind wait_kind, std::optional<Value> target,
     FlagCXCoopKind coop_kind, uint32_t contextId, MemoryOrder order,
-    unsigned ptrAddressSpace = 1);
+    unsigned ptrAddressSpace = 1, bool collectiveFence = false);
 
 } // namespace mlir::triton::tle
